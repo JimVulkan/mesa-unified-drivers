@@ -26,8 +26,6 @@ P65), Panfrost on the Mali-G76 and the Mali-G72. Other Xclipse models are not co
   runs the work of several), 64-bit floats in software, viewport arrays, cull distances, query
   buffer objects and indirect draw parameters.
 - Presentation through Android's gralloc (Arm's handle layout, including MediaTek's).
-- Minecraft Java through its Vulkan renderer (MojoLauncher), which the stock Mali driver cannot run
-  because it only exposes Vulkan 1.1.
 
 Not done yet: BCn texture formats on Mali, and in Panfrost a geometry shader together with
 tessellation, and transform feedback from either.
