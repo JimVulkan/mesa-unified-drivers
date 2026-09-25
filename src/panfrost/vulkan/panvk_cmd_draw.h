@@ -223,6 +223,10 @@ struct panvk_cmd_graphics_state {
       uint64_t xfb_counts;
       uint64_t xfb_staging;
       uint32_t xfb_invocations;
+      /* geometryStreams, see panvk_gs_push::xfb_stream_*. */
+      uint64_t xfb_stream_index;
+      uint32_t xfb_stream_slots;
+      uint32_t xfb_stream_idx;
       /* gl_ViewportIndex: the per-viewport transform table (panvk_gs_push::viewports). */
       uint64_t viewports;
    } gs;
@@ -285,6 +289,9 @@ struct panvk_cmd_graphics_state {
       uint64_t dev_addr;
       uint64_t size;
       uint8_t index_size;
+      /* The indices can be read on the CPU at record time: the buffer's GPU address is also its
+       * CPU address (kbase SAME_VA), and its usage lets nothing but the CPU write it. */
+      bool cpu_readable;
    } ib;
 
    struct {

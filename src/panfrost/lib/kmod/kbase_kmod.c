@@ -146,6 +146,10 @@ union kbase_ioctl_mem_import {
  * syncs CPU caches.) */
 #define BASE_MEM_COHERENT_LOCAL (1ull << 11)
 
+/* Bit 12: the CPU mapping is cacheable. The GPU does not snoop CPU caches here, so the CPU side
+ * needs explicit cache maintenance (PAN_KMOD_BO_FLAG_WB_MMAP). */
+#define BASE_MEM_CACHED_CPU (1ull << 12)
+
 /* PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT, the tiler heap, the indirect varying buffer and the tess
  * heap: 336 MB between them, all of it committed at vkCreateDevice when this flag was ignored
  * (measured, MemAvailable fell 331 MB; the vendor's device costs 3). GROW_ON_GPF commits
@@ -344,6 +348,13 @@ kbase_kmod_query_props(int fd, struct pan_kmod_dev_props *props)
    props->pgsize_bitmap = PAN_PGSIZE_4K | PAN_PGSIZE_2M;
    props->is_io_coherent = false;
 
+   /* CPU-cached mappings, which the vendor driver also hands out (its 0x380f allocations carry
+    * CACHED_CPU). Not coherent with the GPU -- RAW_COHERENCY_MODE reads COHERENCY_NONE on the
+    * S10e -- so they back PanVK's HOST_CACHED, non-HOST_COHERENT memory type, whose flushes and
+    * invalidates PanVK does from userspace (DC CVAC / DC CIVAC). Without such a type every CPU
+    * read of GPU output went through an uncached mapping. */
+   props->supported_bo_flags |= PAN_KMOD_BO_FLAG_WB_MMAP;
+
    /* Without this the mask is zero, every queue priority is refused, and vkCreateDevice
     * fails with VK_ERROR_NOT_PERMITTED -- which reads as a permissions problem rather
     * than a field nobody filled in. MEDIUM only: the JM backend does not hook up the
@@ -529,7 +540,8 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev, struct pan_kmod_vm *exclusive_vm, 
          .commit_pages = grow ? MIN2(pages, KBASE_GROW_INITIAL_PAGES) : pages,
          .extension = grow ? KBASE_GROW_STEP_PAGES : 0,
          .flags = exec ? KBASE_MEM_FLAGS_EXEC
-                       : KBASE_MEM_FLAGS_RW | (grow ? BASE_MEM_GROW_ON_GPF : 0),
+                       : KBASE_MEM_FLAGS_RW | (grow ? BASE_MEM_GROW_ON_GPF : 0) |
+                            ((flags & PAN_KMOD_BO_FLAG_WB_MMAP) ? BASE_MEM_CACHED_CPU : 0),
       },
    };
 
@@ -763,6 +775,8 @@ enum ks_state {
 
 struct ks_obj {
    uint8_t state;
+   /* KS_SUBMITTED from an import: nothing here signals it, the sync file below does. */
+   bool external;
    int fd; /* KS_SUBMITTED: a sync file signaling with it, or -1 */
 };
 
@@ -806,6 +820,7 @@ ks_set_state(struct ks_obj *o, uint8_t state, int fd)
    if (o->fd >= 0)
       close(o->fd);
    o->state = state;
+   o->external = false;
    o->fd = fd;
 }
 
@@ -828,13 +843,13 @@ ks_create(struct util_sync_provider *p, uint32_t flags, uint32_t *handle)
          return ks_ret(-ENOMEM);
       }
       for (uint32_t k = ks_cap; k < cap; k++)
-         o[k] = (struct ks_obj){KS_FREE, -1};
+         o[k] = (struct ks_obj){.state = KS_FREE, .fd = -1};
       i = ks_cap;
       ks_objs = o;
       ks_cap = cap;
    }
    ks_objs[i] = (struct ks_obj){
-      (flags & DRM_SYNCOBJ_CREATE_SIGNALED) ? KS_SIGNALED : KS_UNSIGNALED, -1};
+      .state = (flags & DRM_SYNCOBJ_CREATE_SIGNALED) ? KS_SIGNALED : KS_UNSIGNALED, .fd = -1};
    ks_hint = i + 1;
    *handle = i + 1;
    pthread_mutex_unlock(&ks_lock);
@@ -925,10 +940,18 @@ ks_wait_locked(uint32_t *handles, unsigned n, int64_t timeout_nsec, unsigned fla
 
    for (;;) {
       unsigned done = 0, first = UINT32_MAX;
+      bool external = false;
       for (unsigned i = 0; i < n; i++) {
-         const struct ks_obj *o = ks_get(handles[i]);
+         struct ks_obj *o = ks_get(handles[i]);
          if (!o)
             return -EINVAL;
+         if (o->state == KS_SUBMITTED && o->external) {
+            struct pollfd pfd = {.fd = o->fd, .events = POLLIN};
+            if (o->fd < 0 || poll(&pfd, 1, 0) > 0)
+               ks_set_state(o, KS_SIGNALED, -1);
+            else
+               external = true;
+         }
          if (o->state == KS_SIGNALED || (available && o->state == KS_SUBMITTED)) {
             done++;
             first = MIN2(first, i);
@@ -941,7 +964,12 @@ ks_wait_locked(uint32_t *handles, unsigned n, int64_t timeout_nsec, unsigned fla
       }
       if (timeout_nsec != INT64_MAX && (uint64_t)timeout_nsec <= ks_now())
          return -ETIME;
-      if (timeout_nsec == INT64_MAX) {
+      if (external) {
+         /* An imported sync file signals without telling anyone: look again in a millisecond. */
+         const uint64_t next = MIN2((uint64_t)timeout_nsec, ks_now() + 1000000ull);
+         const struct timespec ts = {.tv_sec = next / 1000000000ull, .tv_nsec = next % 1000000000ull};
+         pthread_cond_timedwait(&ks_cond, &ks_lock, &ts);
+      } else if (timeout_nsec == INT64_MAX) {
          pthread_cond_wait(&ks_cond, &ks_lock);
       } else {
          const struct timespec ts = {.tv_sec = timeout_nsec / 1000000000ll,
@@ -985,6 +1013,7 @@ ks_transfer(struct util_sync_provider *p, uint32_t dst, uint64_t dst_point, uint
    struct ks_obj *d = ks_get(dst), *s = ks_get(src);
    if (d && s && d != s) {
       ks_set_state(d, s->state, s->fd >= 0 ? dup(s->fd) : -1);
+      d->external = s->external;
       pthread_cond_broadcast(&ks_cond);
    }
    pthread_mutex_unlock(&ks_lock);
@@ -1018,15 +1047,31 @@ ks_export_sync_file(struct util_sync_provider *p, uint32_t handle, int *out_fd)
    return 0;
 }
 
+/* Not a CPU wait: the object stays pending on a copy of the sync file, and a wait on it polls
+ * that. Waiting here held vkAcquireNextImageKHR until the compositor released the buffer, and a
+ * present (vkQueueSignalReleaseImageANDROID imports the frame's own fence) until the GPU had
+ * finished the frame. A submission waiting on such an object still waits on the CPU, but by then
+ * the compositor has normally long released the buffer. */
 static int
 ks_import_sync_file(struct util_sync_provider *p, uint32_t handle, int fd)
 {
-   if (fd >= 0) {
-      struct pollfd pfd = {.fd = fd, .events = POLLIN};
-      if (poll(&pfd, 1, 10000) <= 0)
-         mesa_loge("kbase: imported sync file did not signal within 10 s");
+   struct pollfd pfd = {.fd = fd, .events = POLLIN};
+   if (fd < 0 || poll(&pfd, 1, 0) > 0)
+      return ks_signal(p, &handle, 1);
+   const int copy = dup(fd);
+   if (copy < 0)
+      return ks_ret(-errno);
+   pthread_mutex_lock(&ks_lock);
+   struct ks_obj *o = ks_get(handle);
+   if (o) {
+      ks_set_state(o, KS_SUBMITTED, copy);
+      o->external = true;
+      pthread_cond_broadcast(&ks_cond);
+   } else {
+      close(copy);
    }
-   return ks_signal(p, &handle, 1);
+   pthread_mutex_unlock(&ks_lock);
+   return ks_ret(o ? 0 : -EINVAL);
 }
 
 static int
@@ -1535,6 +1580,14 @@ kbase_kmod_query_timestamp(const struct pan_kmod_dev *dev)
 #endif
 }
 
+/* Cache maintenance of WB_MMAP mappings is done from userspace (pan_kmod_queue_bo_map_sync), so
+ * nothing is ever queued for the kernel. */
+static int
+kbase_kmod_flush_bo_map_syncs(struct pan_kmod_dev *dev)
+{
+   return 0;
+}
+
 const struct pan_kmod_ops kbase_kmod_ops = {
    .dev_create = kbase_kmod_dev_create,
    .dev_destroy = kbase_kmod_dev_destroy,
@@ -1549,4 +1602,5 @@ const struct pan_kmod_ops kbase_kmod_ops = {
    .vm_destroy = kbase_kmod_vm_destroy,
    .vm_bind = kbase_kmod_vm_bind,
    .query_timestamp = kbase_kmod_query_timestamp,
+   .flush_bo_map_syncs = kbase_kmod_flush_bo_map_syncs,
 };

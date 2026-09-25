@@ -123,6 +123,16 @@ struct panvk_gs_push {
    /* Leave output positions in clip space: the tess eval stage when a geometry shader reads
     * them, which a screen-space round trip would move by a rounding step. */
    uint32_t out_clip_space;
+   /* geometryStreams. Every stream the shader emits on owns a copy of the output vertex slots
+    * (xfb_stream_slots per stream, stream s at s * xfb_stream_slots) and, for capture, its own
+    * primitive index list and counts; only stream 0 is rasterised. xfb_stream_index holds the
+    * index lists of streams 1-3, xfb_stream_idx entries each (stream 0's is out_index), and the
+    * counts of stream s start at s * xfb_invocations in xfb_counts. */
+   uint64_t xfb_stream_index;
+   uint32_t xfb_stream_slots;
+   uint32_t xfb_stream_idx;
+   uint32_t xfb_invocations;
+   uint32_t pad4;
 };
 
 /* gl_ViewportIndex, carried from the emulation to the fragment shader. VARYING_SLOT_VIEWPORT is a
@@ -171,6 +181,8 @@ struct panvk_gs_lower_options {
 
    /* Transform feedback: stage a capture record at every EmitVertex (panvk_gs_xfb_table()). */
    const struct nir_xfb_info *xfb;
+   /* The vertex streams the shader emits on (nir->info.gs.active_stream_mask). */
+   unsigned stream_mask;
 };
 
 bool panvk_nir_lower_gs(struct nir_shader *nir, const struct panvk_gs_lower_options *opts);

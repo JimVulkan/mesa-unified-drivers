@@ -25,9 +25,12 @@ P65), Panfrost on the Mali-G76 and the Mali-G72. Other Xclipse models are not co
 - OpenGL: compute shaders with up to 1024 invocations per workgroup (Bifrost runs 256, so each
   runs the work of several), 64-bit floats in software, viewport arrays, cull distances, query
   buffer objects and indirect draw parameters.
+- PanVK: `VK_EXT_robustness2` (out-of-range and null descriptor accesses read zero) and geometry
+  shader vertex streams, which DXVK requires for Direct3D 9, 10 and 11. BCn textures still have
+  to come from the app: Winlator-based emulators decode them in their Vulkan wrapper.
 - Presentation through Android's gralloc (Arm's handle layout, including MediaTek's).
 
-Not done yet: BCn texture formats on Mali, and in Panfrost a geometry shader together with
+Not done yet: BCn texture formats on Mali, what vkd3d-proton needs for Direct3D 12 in PanVK, and in Panfrost a geometry shader together with
 tessellation, and transform feedback from either.
 
 On phones with 4 GB of RAM or less, give Minecraft about 600 MB of Java heap: GPU memory comes out

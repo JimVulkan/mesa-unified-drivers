@@ -422,8 +422,9 @@ vk_drm_syncobj_import_sync_file(struct vk_device *device,
 
    /* Xclipse 920 (Samsung sgpu): foreign dma_fences imported as submit dependencies can lock up the
     * kernel at first present. CPU-wait the sync_file before importing (up to 3 s); on timeout
-    * import anyway. */
-   if (sync_file >= 0)
+    * import anyway. Only where the driver asks for it: on the Mali kbase path this made the
+    * present of every frame wait for the GPU to finish it (see vk_device::sync_file_import_cpu_wait). */
+   if (sync_file >= 0 && device->sync_file_import_cpu_wait)
       sync_wait(sync_file, 3000 /* ms */);
 
    int err = device->sync->import_sync_file(device->sync, sobj->syncobj, sync_file);

@@ -941,6 +941,9 @@ panlib_xfb_copy(global struct libpan_xfb_draw *d)
          for (uint32_t j = 0; j < k_dw; j++) {
             const uint32_t e = table[j];
             const uint32_t b = e >> 16;
+            /* Another stream's buffer (geometryStreams): not this pass's to write. */
+            if (!d->stride[b])
+               continue;
             global uint32_t *dst =
                (global uint32_t *)(d->buffer[b] + d->start[b] + v * d->stride[b]);
             dst[e & 0xffff] = rec[j];

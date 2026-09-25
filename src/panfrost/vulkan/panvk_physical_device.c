@@ -311,7 +311,10 @@ get_device_heaps(struct panvk_physical_device *device,
     * type is also the one requiring no CPU cache maintenance if we're asked
     * to.
     */
-   if (PANVK_DEBUG(COHERENT_BEFORE_CACHED) &&
+   /* On kbase the cached type is new, and the apps that run here were written against drivers
+    * without it: put the type that needs no cache maintenance first, so an app that takes the
+    * first HOST_VISIBLE type and never flushes keeps working. */
+   if ((PANVK_DEBUG(COHERENT_BEFORE_CACHED) || pan_kmod_dev_is_kbase(device->kmod.dev)) &&
        host_cached_not_coherent_idx != -1 &&
        host_coherent_not_cached_idx != -1 &&
        host_coherent_not_cached_idx > host_cached_not_coherent_idx) {

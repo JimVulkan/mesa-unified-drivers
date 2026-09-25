@@ -10,6 +10,7 @@
 #include "panvk_device_memory.h"
 #include "panvk_entrypoints.h"
 
+#include "kmod/kbase_kmod.h"
 #include "pan_desc.h"
 #include "pan_util.h"
 
@@ -1072,7 +1073,11 @@ panvk_per_arch(CmdBindVertexBuffers2)(VkCommandBuffer commandBuffer,
          cmdbuf->state.gfx.vb.bufs[firstBinding + i].size = panvk_buffer_range(
             buffer, pOffsets[i], pSizes ? pSizes[i] : VK_WHOLE_SIZE);
       } else {
-         cmdbuf->state.gfx.vb.bufs[firstBinding + i].address = 0;
+         /* A null buffer (nullDescriptor) reads zeros. On Bifrost that is zeroed memory nothing
+          * writes rather than address 0, which the attribute fetch would fault on. */
+         const struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+         cmdbuf->state.gfx.vb.bufs[firstBinding + i].address =
+            PAN_ARCH < 9 ? dev->null_descs.zero_addr : 0;
          cmdbuf->state.gfx.vb.bufs[firstBinding + i].size = 0;
       }
    }
@@ -1094,7 +1099,23 @@ panvk_per_arch(CmdBindIndexBuffer2)(VkCommandBuffer commandBuffer,
       cmdbuf->state.gfx.ib.size = panvk_buffer_range(buf, offset, size);
       assert(cmdbuf->state.gfx.ib.size <= UINT32_MAX);
       cmdbuf->state.gfx.ib.dev_addr = panvk_buffer_gpu_ptr(buf, offset);
+
+      /* Every usage through which the GPU could write the buffer. Without any of them, the
+       * contents at execution time are what the CPU wrote, which a streaming index buffer has
+       * written by the time the draw is recorded. */
+      const VkBufferUsageFlags2KHR gpu_writes =
+         VK_BUFFER_USAGE_2_TRANSFER_DST_BIT_KHR |
+         VK_BUFFER_USAGE_2_STORAGE_TEXEL_BUFFER_BIT_KHR |
+         VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT_KHR |
+         VK_BUFFER_USAGE_2_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT |
+         VK_BUFFER_USAGE_2_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT |
+         VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT_KHR;
+      struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+      cmdbuf->state.gfx.ib.cpu_readable =
+         PAN_ARCH < 9 && pan_kmod_dev_is_kbase(dev->kmod.dev) &&
+         cmdbuf->state.gfx.ib.dev_addr && !(buf->vk.usage & gpu_writes);
    } else {
+      cmdbuf->state.gfx.ib.cpu_readable = false;
       cmdbuf->state.gfx.ib.size = 0;
       /* In case of NullDescriptors, we need to set a non-NULL address and rely
        * on out-of-bounds behavior against the zero size of the buffer. Note

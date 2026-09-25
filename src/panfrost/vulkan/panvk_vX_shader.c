@@ -382,6 +382,17 @@ panvk_buffer_ubo_addr_format(VkPipelineRobustnessBufferBehaviorEXT robustness)
    }
 }
 
+/* A null SSBO (nullDescriptor) is address 0 with size 0 before v9: only the bounds-checked address
+ * format keeps accesses through it off address 0, so it is used whenever null descriptors are. */
+static inline VkPipelineRobustnessBufferBehaviorEXT
+panvk_ssbo_robustness(const struct vk_pipeline_robustness_state *rs)
+{
+   if (PAN_ARCH < 9 && rs->null_storage_buffer_descriptor &&
+       rs->storage_buffers == VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT)
+      return VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_EXT;
+   return rs->storage_buffers;
+}
+
 static inline nir_address_format
 panvk_buffer_ssbo_addr_format(VkPipelineRobustnessBufferBehaviorEXT robustness)
 {
@@ -396,6 +407,34 @@ panvk_buffer_ssbo_addr_format(VkPipelineRobustnessBufferBehaviorEXT robustness)
    default:
       UNREACHABLE("Invalid robust buffer access behavior");
    }
+}
+
+/* The vertex streams a geometry shader emits on, from its EmitStreamVertex/EndStreamPrimitive
+ * themselves: nir->info.gs.active_stream_mask is not gathered yet where this is needed. */
+static unsigned
+gs_stream_mask(nir_shader *nir)
+{
+   unsigned mask = 1;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            switch (intr->intrinsic) {
+            case nir_intrinsic_emit_vertex:
+            case nir_intrinsic_end_primitive:
+            case nir_intrinsic_emit_vertex_with_counter:
+            case nir_intrinsic_end_primitive_with_counter:
+               mask |= 1u << nir_intrinsic_stream_id(intr);
+               break;
+            default:
+               break;
+            }
+         }
+      }
+   }
+   return mask;
 }
 
 static const nir_shader_compiler_options *
@@ -413,7 +452,7 @@ panvk_get_spirv_options(UNUSED struct vk_physical_device *vk_pdev,
 {
    return (struct spirv_to_nir_options){
       .ubo_addr_format = panvk_buffer_ubo_addr_format(rs->uniform_buffers),
-      .ssbo_addr_format = panvk_buffer_ssbo_addr_format(rs->storage_buffers),
+      .ssbo_addr_format = panvk_buffer_ssbo_addr_format(panvk_ssbo_robustness(rs)),
       .phys_ssbo_addr_format = nir_address_format_64bit_global,
       .shared_addr_format = nir_address_format_32bit_offset,
       .min_ubo_alignment = 16,
@@ -861,7 +900,7 @@ panvk_lower_nir(struct panvk_device *dev, nir_shader *nir,
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ubo,
             panvk_buffer_ubo_addr_format(rs->uniform_buffers));
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo,
-            panvk_buffer_ssbo_addr_format(rs->storage_buffers));
+            panvk_buffer_ssbo_addr_format(panvk_ssbo_robustness(rs)));
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const,
             nir_address_format_32bit_offset);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_global,
@@ -871,7 +910,7 @@ panvk_lower_nir(struct panvk_device *dev, nir_shader *nir,
     * descriptor-level bounds check Mali HW does for native buffer
     * loads/stores is bypassed. Insert software bounds checks here for SSBO
     * accesses when robust storage buffer access is requested. */
-   if (rs->storage_buffers != VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT) {
+   if (panvk_ssbo_robustness(rs) != VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT) {
       NIR_PASS(_, nir, nir_lower_robust_access, is_robust_ssbo_intr, NULL);
       NIR_PASS(_, nir, nir_opt_constant_folding);
       NIR_PASS(_, nir, nir_opt_dce);
@@ -1504,7 +1543,7 @@ panvk_compile_shader(struct panvk_device *dev,
    nir_variable_mode robust_modes = 0;
    if (info->robustness->uniform_buffers != VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT)
       robust_modes |= nir_var_mem_ubo;
-   if (info->robustness->storage_buffers != VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT)
+   if (panvk_ssbo_robustness(info->robustness) != VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT)
       robust_modes |= nir_var_mem_ssbo;
 
    struct pan_compile_inputs inputs = {
@@ -1804,13 +1843,17 @@ panvk_compile_shader(struct panvk_device *dev,
                              "this geometry shader's transform feedback cannot be captured");
       }
       variant->gs.xfb_dwords = xfb_dwords;
-      for (unsigned b = 0; b < 4; b++)
+      for (unsigned b = 0; b < 4; b++) {
          variant->gs.xfb_strides[b] =
             nir->xfb_info && (nir->xfb_info->buffers_written & BITFIELD_BIT(b))
                ? nir->xfb_info->buffers[b].stride
                : 0;
+         variant->gs.xfb_buffer_stream[b] = nir->xfb_info ? nir->xfb_info->buffer_to_stream[b] : 0;
+      }
+      variant->gs.stream_mask = gs_stream_mask(nir);
 
       const struct panvk_gs_lower_options gs_opts = {
+         .stream_mask = variant->gs.stream_mask,
          .input_verts_per_prim = in_verts,
          .output_verts_per_prim = out_verts,
          .max_output_verts = variant->gs.max_output_verts,
@@ -1950,8 +1993,10 @@ panvk_compile_shader(struct panvk_device *dev,
             nir->xfb_info && (nir->xfb_info->buffers_written & BITFIELD_BIT(b))
                ? nir->xfb_info->buffers[b].stride
                : 0;
+      variant->gs.stream_mask = 1;
 
       const struct panvk_gs_lower_options tes_opts = {
+         .stream_mask = 1,
          .input_verts_per_prim = 1,
          .output_verts_per_prim = 1,
          .max_output_verts = 1,

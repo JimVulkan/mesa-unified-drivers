@@ -24,6 +24,7 @@
 #include "panvk_device.h"
 #include "panvk_cmd_draw.h"
 #include "panvk_entrypoints.h"
+#include "panvk_image_view.h"
 #include "panvk_instance.h"
 #include "panvk_macros.h"
 #include "panvk_physical_device.h"
@@ -41,6 +42,7 @@
 #include "util/u_printf.h"
 #include "pan_props.h"
 #include "pan_samples.h"
+#include "pan_buffer.h"
 
 static void *
 panvk_kmod_zalloc(const struct pan_kmod_allocator *allocator, size_t size,
@@ -328,6 +330,130 @@ panvk_queue_destroy(struct vk_queue *queue)
    }
 }
 
+#if PAN_ARCH < 9
+/* See panvk_device::null_descs. Built through the device's own entry points, so the texture and
+ * attribute descriptors come out exactly as for an application's image and buffer. kbase hands
+ * out zeroed pages, and nothing ever writes these: a null storage image or texel buffer has a
+ * 0-byte range, so its stores are dropped. */
+static VkResult
+panvk_init_null_descs(struct panvk_device *dev)
+{
+   const struct vk_device_dispatch_table *t = &dev->vk.dispatch_table;
+   VkDevice h = panvk_device_to_handle(dev);
+   VkResult result;
+
+   const VkImageCreateInfo ici = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+      .imageType = VK_IMAGE_TYPE_2D,
+      .format = VK_FORMAT_R8G8B8A8_UNORM,
+      .extent = {1, 1, 1},
+      .mipLevels = 1,
+      .arrayLayers = 1,
+      .samples = VK_SAMPLE_COUNT_1_BIT,
+      .tiling = VK_IMAGE_TILING_LINEAR,
+      .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
+   };
+   result = t->CreateImage(h, &ici, NULL, &dev->null_descs.image);
+   if (result != VK_SUCCESS)
+      return result;
+
+   VkMemoryRequirements mr;
+   t->GetImageMemoryRequirements(h, dev->null_descs.image, &mr);
+   VkMemoryAllocateInfo mai = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .allocationSize = mr.size,
+      .memoryTypeIndex = ffs(mr.memoryTypeBits) - 1,
+   };
+   result = t->AllocateMemory(h, &mai, NULL, &dev->null_descs.image_mem);
+   if (result != VK_SUCCESS)
+      return result;
+   t->BindImageMemory(h, dev->null_descs.image, dev->null_descs.image_mem, 0);
+
+   const VkImageViewCreateInfo vci = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+      .image = dev->null_descs.image,
+      .viewType = VK_IMAGE_VIEW_TYPE_2D,
+      .format = VK_FORMAT_R8G8B8A8_UNORM,
+      .components = {VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO,
+                     VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO},
+      .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+   };
+   result = t->CreateImageView(h, &vci, NULL, &dev->null_descs.view);
+   if (result != VK_SUCCESS)
+      return result;
+
+   VK_FROM_HANDLE(panvk_image_view, view, dev->null_descs.view);
+   static_assert(sizeof(view->descs.tex[0]) == sizeof(dev->null_descs.tex), "texture size");
+   static_assert(sizeof(view->descs.img_attrib_buf) == sizeof(dev->null_descs.img), "image size");
+   memcpy(dev->null_descs.tex, &view->descs.tex[0], sizeof(dev->null_descs.tex));
+
+   struct mali_attribute_buffer_packed img[2];
+   memcpy(img, view->descs.img_attrib_buf, sizeof(img));
+   pan_unpack(&img[0], ATTRIBUTE_BUFFER, img_cfg);
+   pan_pack(&img[0], ATTRIBUTE_BUFFER, cfg) {
+      cfg = img_cfg;
+      cfg.size = 0;
+   }
+   memcpy(dev->null_descs.img, img, sizeof(img));
+
+   const VkBufferCreateInfo bci = {
+      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+      .size = 4096,
+      .usage = VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT |
+               VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+   };
+   result = t->CreateBuffer(h, &bci, NULL, &dev->null_descs.buffer);
+   if (result != VK_SUCCESS)
+      return result;
+   t->GetBufferMemoryRequirements(h, dev->null_descs.buffer, &mr);
+   mai.allocationSize = mr.size;
+   mai.memoryTypeIndex = ffs(mr.memoryTypeBits) - 1;
+   result = t->AllocateMemory(h, &mai, NULL, &dev->null_descs.buffer_mem);
+   if (result != VK_SUCCESS)
+      return result;
+   t->BindBufferMemory(h, dev->null_descs.buffer, dev->null_descs.buffer_mem, 0);
+
+   VK_FROM_HANDLE(panvk_buffer, buffer, dev->null_descs.buffer);
+   dev->null_descs.zero_addr = panvk_buffer_gpu_ptr(buffer, 0);
+
+   struct {
+      struct mali_attribute_buffer_packed buf;
+      struct mali_attribute_packed attr;
+      uint32_t pad[2];
+   } texel = {0};
+   static_assert(sizeof(texel) == sizeof(dev->null_descs.texel), "texel buffer size");
+   const struct pan_buffer_view bview = {
+      .format = PIPE_FORMAT_R32_UINT,
+      .width_el = 0,
+      .base = dev->null_descs.zero_addr,
+   };
+   GENX(pan_buffer_texture_emit)(&bview, &texel.buf, &texel.attr);
+   memcpy(dev->null_descs.texel, &texel, sizeof(texel));
+
+   dev->null_descs.valid = true;
+   return VK_SUCCESS;
+}
+
+static void
+panvk_finish_null_descs(struct panvk_device *dev)
+{
+   const struct vk_device_dispatch_table *t = &dev->vk.dispatch_table;
+   VkDevice h = panvk_device_to_handle(dev);
+
+   if (dev->null_descs.view)
+      t->DestroyImageView(h, dev->null_descs.view, NULL);
+   if (dev->null_descs.image)
+      t->DestroyImage(h, dev->null_descs.image, NULL);
+   if (dev->null_descs.image_mem)
+      t->FreeMemory(h, dev->null_descs.image_mem, NULL);
+   if (dev->null_descs.buffer)
+      t->DestroyBuffer(h, dev->null_descs.buffer, NULL);
+   if (dev->null_descs.buffer_mem)
+      t->FreeMemory(h, dev->null_descs.buffer_mem, NULL);
+   memset(&dev->null_descs, 0, sizeof(dev->null_descs));
+}
+#endif
+
 VkResult
 panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
                               const VkDeviceCreateInfo *pCreateInfo,
@@ -574,6 +700,16 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
    if (result != VK_SUCCESS)
       goto err_free_draw_ctx;
 
+#if PAN_ARCH < 9
+   /* Always, not only with nullDescriptor: a few KB, and an application that binds null without
+    * enabling the feature then reads zeros instead of faulting the GPU. */
+   result = panvk_init_null_descs(device);
+   if (result != VK_SUCCESS) {
+      panvk_finish_null_descs(device);
+      goto err_finish_queues;
+   }
+#endif
+
    for (unsigned i = 0; i < pCreateInfo->queueCreateInfoCount; i++) {
       const VkDeviceQueueCreateInfo *queue_create =
          &pCreateInfo->pQueueCreateInfos[i];
@@ -666,6 +802,10 @@ panvk_per_arch(destroy_device)(struct panvk_device *device,
 
    vk_foreach_queue_safe(queue, &device->vk)
       panvk_queue_destroy(queue);
+
+#if PAN_ARCH < 9
+   panvk_finish_null_descs(device);
+#endif
 
    for (unsigned i = 0; i < ARRAY_SIZE(device->polygon_gs.shader); i++) {
       if (device->polygon_gs.shader[i])

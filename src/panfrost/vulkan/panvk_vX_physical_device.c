@@ -95,7 +95,9 @@ panvk_per_arch(get_physical_device_extensions)(
       .KHR_pipeline_library = true,
       .KHR_push_descriptor = true,
       .KHR_relaxed_block_layout = true,
-      .KHR_robustness2 = PAN_ARCH >= 10,
+      /* Bifrost (v6/v7): bounds-checked SSBOs and hardware-checked UBOs already give the
+       * robustBufferAccess2 results, null descriptors are emulated (panvk_device::null_descs). */
+      .KHR_robustness2 = PAN_ARCH <= 7 || PAN_ARCH >= 10,
       .KHR_sampler_mirror_clamp_to_edge = true,
       .KHR_sampler_ycbcr_conversion = true,
       .KHR_separate_depth_stencil_layouts = true,
@@ -201,7 +203,7 @@ panvk_per_arch(get_physical_device_extensions)(
       .EXT_queue_family_foreign = true,
       .EXT_rasterization_order_attachment_access = PAN_ARCH >= 10,
       .EXT_rgba10x6_formats = PAN_ARCH >= 11,
-      .EXT_robustness2 = PAN_ARCH >= 10,
+      .EXT_robustness2 = PAN_ARCH <= 7 || PAN_ARCH >= 10,
       .EXT_sampler_filter_minmax = PAN_ARCH >= 10,
       .EXT_scalar_block_layout = true,
       .EXT_separate_stencil_usage = true,
@@ -616,7 +618,7 @@ panvk_per_arch(get_physical_device_features)(
 
       /* VK_EXT_transform_feedback: from geometry shaders, stream 0. */
       .transformFeedback = PAN_ARCH < 9,
-      .geometryStreams = false,
+      .geometryStreams = PAN_ARCH < 9,
 
       /* VK_EXT_primitive_topology_list_restart */
       .primitiveTopologyListRestart = true,
@@ -640,9 +642,9 @@ panvk_per_arch(get_physical_device_features)(
       .pipelineExecutableInfo = true,
 
       /* VK_KHR_robustness2 */
-      .robustBufferAccess2 = PAN_ARCH >= 11,
+      .robustBufferAccess2 = PAN_ARCH <= 7 || PAN_ARCH >= 11,
       .robustImageAccess2 = false,
-      .nullDescriptor = PAN_ARCH >= 10,
+      .nullDescriptor = PAN_ARCH <= 7 || PAN_ARCH >= 10,
 
       /* VK_EXT_shader_tile_image */
       .shaderTileImageColorReadAccess = PAN_ARCH >= 9,
@@ -1307,7 +1309,7 @@ panvk_per_arch(get_physical_device_properties)(
 
       /* VK_EXT_transform_feedback. The data sizes are the staging record,
        * PANVK_XFB_MAX_RECORD_DWORDS dwords per vertex. */
-      .maxTransformFeedbackStreams = 1,
+      .maxTransformFeedbackStreams = PAN_ARCH < 9 ? 4 : 1,
       .maxTransformFeedbackBuffers = 4,
       .maxTransformFeedbackBufferSize = UINT32_MAX,
       .maxTransformFeedbackStreamDataSize = PANVK_XFB_MAX_RECORD_DWORDS * 4,

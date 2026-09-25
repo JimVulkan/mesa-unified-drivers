@@ -88,6 +88,8 @@ cmd_get_push_desc_set(struct vk_command_buffer *vk_cmdbuf,
    if (desc_state->push_sets[set_idx] == NULL) {
       desc_state->push_sets[set_idx] = &push_set->set;
       push_set->set.descs.host = push_set->descs;
+      /* Descriptor writes look the device up through the set (null descriptors). */
+      push_set->set.base.device = cmdbuf->vk.base.device;
    }
 
    struct panvk_descriptor_set *set = desc_state->push_sets[set_idx];

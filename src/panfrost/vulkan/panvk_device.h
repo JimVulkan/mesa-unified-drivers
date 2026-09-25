@@ -80,6 +80,22 @@ struct panvk_device {
       struct vk_shader *shader[2];
    } polygon_gs;
 
+   /* Bifrost (v6/v7) has no NULL descriptor. With nullDescriptor enabled, a null write copies one
+    * of these instead: a texture reading zeros (an internal 1x1 image with a ZERO swizzle), and a
+    * storage image and texel buffer whose attribute buffer is 0 bytes, so loads return zeros and
+    * stores are dropped by the bounds check. zero_addr is 4 KB of zeroes nothing writes, what null
+    * vertex buffers, UBOs and SSBOs point at. */
+   struct {
+      bool valid;
+      uint32_t tex[8], img[8], texel[8];
+      uint64_t zero_addr;
+      VkImage image;
+      VkDeviceMemory image_mem;
+      VkImageView view;
+      VkBuffer buffer;
+      VkDeviceMemory buffer_mem;
+   } null_descs;
+
    struct {
       struct panvk_priv_bo *handlers_bo;
       uint32_t handler_stride;

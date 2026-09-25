@@ -236,6 +236,12 @@ struct vk_device {
                                   uint32_t signal_count,
                                   const struct vk_sync_signal *signals);
 
+   /* Wait for an imported sync_file to signal on the CPU before handing it to the kernel. Only for
+    * kernels that cannot take a foreign dma_fence as a dependency (Xclipse 920, Samsung sgpu):
+    * everywhere else it makes every present wait for the whole frame on the CPU.
+    */
+   bool sync_file_import_cpu_wait;
+
    /* Set by vk_device_set_drm_fd() */
    struct util_sync_provider *sync;
 

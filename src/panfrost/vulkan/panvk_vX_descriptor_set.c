@@ -88,6 +88,50 @@ write_desc_data(struct panvk_descriptor_set *set, uint32_t binding,
       write_desc(set, binding, elem, &null_desc, (subdesc));                   \
    } while (0)
 #else
+/* See panvk_device::null_descs. */
+static void
+write_nulldesc_v7(struct panvk_descriptor_set *set, uint32_t binding, uint32_t elem,
+                  struct panvk_subdesc_info subdesc, VkDescriptorType type)
+{
+   const struct panvk_device *dev = to_panvk_device(set->base.device);
+   const uint32_t *desc;
+   uint32_t zero[8] = {0};
+
+   switch (type) {
+   case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+   case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+   case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+      desc = dev->null_descs.valid ? dev->null_descs.tex : NULL;
+      break;
+   case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+      desc = dev->null_descs.valid ? dev->null_descs.img : NULL;
+      break;
+   case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+   case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+      desc = dev->null_descs.valid ? dev->null_descs.texel : NULL;
+      break;
+   case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: {
+      /* Size 0 behind the bounds check that nullDescriptor forces on (panvk_ssbo_robustness). */
+      struct panvk_ssbo_addr *ssbo = (struct panvk_ssbo_addr *)zero;
+      ssbo->base_addr = dev->null_descs.zero_addr;
+      desc = zero;
+      break;
+   }
+   default:
+      /* The 4 KB of zeroes as a UBO: a null UBO only has to read zeros. Not a 0-entry UBO: a
+       * pointer 0 read-faults the job, and 0 entries at a mapped pointer made the job end
+       * TERMINATED (measured, probe/mali/robust/vkrobust.c). */
+      pan_pack((struct mali_uniform_buffer_packed *)zero, UNIFORM_BUFFER, cfg) {
+         cfg.pointer = dev->null_descs.zero_addr;
+         cfg.entries = 4096 / 16;
+      }
+      desc = zero;
+      break;
+   }
+   if (desc)
+      write_desc_data(set, binding, elem, subdesc, 0, desc, PANVK_DESCRIPTOR_SIZE);
+}
+
 #define write_nulldesc(set, binding, elem, subdesc)                            \
    do {                                                                        \
    } while (0)
@@ -140,9 +184,18 @@ write_image_view_desc(struct panvk_descriptor_set *set,
 
    if (pImageInfo->imageView == VK_NULL_HANDLE) {
       for (uint8_t plane = 0; plane < binding_layout->textures_per_desc;
-           plane++)
+           plane++) {
+#if PAN_ARCH < 9
+         write_nulldesc_v7(set, binding, elem,
+                           type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                              ? NO_SUBDESC
+                              : get_tex_subdesc_info(type, plane),
+                           type);
+#else
          write_nulldesc(set, binding, elem,
                         get_sampler_subdesc_info(binding_layout->type, plane));
+#endif
+      }
       return;
    }
 
@@ -172,7 +225,11 @@ write_buffer_desc(struct panvk_descriptor_set *set,
                   uint32_t elem, VkDescriptorType type)
 {
    if (info->buffer == VK_NULL_HANDLE) {
+#if PAN_ARCH < 9
+      write_nulldesc_v7(set, binding, elem, NO_SUBDESC, type);
+#else
       write_nulldesc(set, binding, elem, NO_SUBDESC);
+#endif
       return;
    }
 
@@ -246,7 +303,11 @@ write_buffer_view_desc(struct panvk_descriptor_set *set,
                        uint32_t elem, VkDescriptorType type)
 {
    if (bufferView == VK_NULL_HANDLE) {
+#if PAN_ARCH < 9
+      write_nulldesc_v7(set, binding, elem, NO_SUBDESC, type);
+#else
       write_nulldesc(set, binding, elem, NO_SUBDESC);
+#endif
       return;
    }
 

@@ -431,6 +431,10 @@ struct panvk_shader_variant {
       uint32_t xfb_dwords;
       uint32_t xfb_strides[4];
       uint32_t xfb_table[PANVK_XFB_MAX_RECORD_DWORDS];
+      /* geometryStreams: the streams the shader emits on, and the stream each xfb buffer
+       * captures. */
+      uint8_t stream_mask;
+      uint8_t xfb_buffer_stream[4];
       /* Vertex shader variants: compiled to feed the emulation, so gl_Position is clip space
        * (pan_compile_inputs::vs_keep_clip_space) and must be stored unsnapped. */
       bool vs_clip_space;

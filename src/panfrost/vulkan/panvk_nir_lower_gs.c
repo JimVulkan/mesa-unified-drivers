@@ -128,9 +128,12 @@ struct lower_gs_state {
    nir_def *out_vtx_base;
    /* Base output index slot: prim_id * max_output_prims * out_verts_per_prim. */
    nir_def *out_idx_base;
-   /* How many primitives this invocation has already written indices for. Maintained here
-    * because nir_lower_gs_intrinsics does NOT hand it to us -- see lower_end_primitive. */
-   nir_variable *prims_written;
+   /* How many primitives this invocation has already written indices for, per vertex stream.
+    * Maintained here because nir_lower_gs_intrinsics does NOT hand it to us -- see
+    * lower_end_primitive. */
+   nir_variable *prims_written[4];
+   /* geometryStreams: see panvk_gs_push::xfb_stream_*. */
+   nir_def *stream_slots, *stream_idx, *stream_index, *xfb_invocations;
 
    /* This compute invocation, and transform feedback (xfb_dwords == 0: the shader captures
     * nothing). The two addresses are 0 on a draw that is not capturing. */
@@ -149,9 +152,9 @@ panvk_gs_xfb_table(const nir_xfb_info *xfb, uint32_t *table)
    for (unsigned i = 0; i < xfb->output_count; i++) {
       const nir_xfb_output_info *o = &xfb->outputs[i];
 
-      /* Stream 0 and 32-bit data only: geometryStreams is not advertised, and nothing here
-       * produces 16-bit varyings. */
-      if (xfb->buffer_to_stream[o->buffer] != 0 || o->data_is_16bit)
+      /* 32-bit data only: nothing here produces 16-bit varyings. Any stream: a record holds every
+       * captured component, and a stream's copy only writes its own buffers. */
+      if (o->data_is_16bit)
          return -1;
 
       /* component_mask holds absolute components of the location, and the output's dwords are
@@ -394,6 +397,19 @@ load_indirect_inputs(nir_builder *b, const struct panvk_gs_lower_options *opts, 
    return in;
 }
 
+/* A direct indexed draw whose indices the CPU read starts its vertex job at the smallest one, so
+ * its indices are biased by that minimum too; index_min is 0 when there is none to subtract.
+ * Emitted before the indirect branch, whose phi must be the last if popped. */
+static nir_def *
+load_direct_bias(nir_builder *b, const struct panvk_gs_lower_options *opts, nir_def *index_size)
+{
+   nir_def *min_addr = load_param_u64(b, opts, offsetof(struct panvk_gs_push, index_min));
+   nir_push_if(b, nir_iand(b, nir_ine_imm(b, min_addr, 0), nir_ine_imm(b, index_size, 0)));
+   nir_def *v = nir_load_global(b, 1, 32, min_addr, .align_mul = 4);
+   nir_pop_if(b, NULL);
+   return nir_if_phi(b, v, nir_imm_int(b, 0));
+}
+
 /*
  * Which of the vertex shader's varying records is vertex i of this invocation's input
  * primitive. Primitive assembly first -- the position of the vertex in the draw's vertex (or
@@ -553,6 +569,33 @@ lower_per_vertex_input(nir_builder *b, nir_intrinsic_instr *intr,
    return nir_if_phi(b, val, nir_imm_zero(b, intr->def.num_components, intr->def.bit_size));
 }
 
+/* Output vertex slot counter of stream s, the address of entry `entry` of stream s's index list
+ * for this invocation, and the address of its primitive count. Stream 0 is the rasterised one and
+ * keeps the layout it always had. */
+static nir_def *
+stream_vtx_slot(nir_builder *b, struct lower_gs_state *st, unsigned s, nir_def *counter)
+{
+   nir_def *slot = nir_iadd(b, st->out_vtx_base, counter);
+   return s ? nir_iadd(b, slot, nir_imul_imm(b, st->stream_slots, s)) : slot;
+}
+
+static nir_def *
+stream_index_entry(nir_builder *b, struct lower_gs_state *st, unsigned s, nir_def *entry)
+{
+   nir_def *e = nir_iadd(b, st->out_idx_base, entry);
+   if (!s)
+      return nir_iadd(b, st->out_index, nir_u2u64(b, nir_imul_imm(b, e, 4)));
+   e = nir_iadd(b, e, nir_imul_imm(b, st->stream_idx, s - 1));
+   return nir_iadd(b, st->stream_index, nir_u2u64(b, nir_imul_imm(b, e, 4)));
+}
+
+static nir_def *
+stream_count_addr(nir_builder *b, struct lower_gs_state *st, unsigned s)
+{
+   nir_def *i = s ? nir_iadd(b, st->gid, nir_imul_imm(b, st->xfb_invocations, s)) : st->gid;
+   return nir_iadd(b, st->xfb_counts, nir_u2u64(b, nir_imul_imm(b, i, 4)));
+}
+
 /*
  * EmitVertex(). nir_lower_gs_intrinsics has already given us the running vertex counter, and
  * nir_lower_io_vars_to_temporaries has already turned the shader's outputs into variables we can read
@@ -563,6 +606,31 @@ lower_emit_vertex(nir_builder *b, nir_intrinsic_instr *intr, struct lower_gs_sta
 {
    const struct panvk_gs_lower_options *opts = st->opts;
    nir_def *counter = intr->src[0].ssa;
+   const unsigned stream = nir_intrinsic_stream_id(intr);
+
+   /* A vertex on another stream than 0 is never rasterised: it only matters to transform
+    * feedback, which stages it in its stream's slots and records it at EndStreamPrimitive. */
+   if (stream != 0) {
+      if (!st->xfb_dwords)
+         return;
+      nir_push_if(b, nir_iand(b, nir_ult_imm(b, counter, opts->max_output_verts),
+                              nir_ine_imm(b, st->xfb_staging, 0)));
+      {
+         nir_def *slot = stream_vtx_slot(b, st, stream, counter);
+         stage_xfb_record(b, st, slot);
+         if (opts->output_verts_per_prim == 1) {
+            nir_def *n = nir_load_var(b, st->prims_written[stream]);
+            nir_store_global(b, slot, stream_index_entry(b, st, stream, n), .align_mul = 4,
+                             .write_mask = 0x1);
+            nir_def *written = nir_iadd_imm(b, n, 1);
+            nir_store_var(b, st->prims_written[stream], written, 1);
+            nir_store_global(b, written, stream_count_addr(b, st, stream), .align_mul = 4,
+                             .write_mask = 0x1);
+         }
+      }
+      nir_pop_if(b, NULL);
+      return;
+   }
 
    /* Refuse to run off the end of the slot we were given. A shader that emits more than it
     * declared is invalid, but it must not be allowed to scribble on the next primitive. */
@@ -659,7 +727,7 @@ lower_emit_vertex(nir_builder *b, nir_intrinsic_instr *intr, struct lower_gs_sta
                                                                         counter), 4)));
          nir_store_global(b, slot, addr, .align_mul = 4, .write_mask = 0x1);
          nir_def *written = nir_iadd_imm(b, counter, 1);
-         nir_store_var(b, st->prims_written, written, 1);
+         nir_store_var(b, st->prims_written[0], written, 1);
          if (st->xfb_dwords) {
             nir_push_if(b, nir_ine_imm(b, st->xfb_counts, 0));
             nir_store_global(b, written,
@@ -682,6 +750,11 @@ lower_end_primitive(nir_builder *b, nir_intrinsic_instr *intr, struct lower_gs_s
 {
    const struct panvk_gs_lower_options *opts = st->opts;
    const unsigned vpp = opts->output_verts_per_prim;
+   const unsigned stream = nir_intrinsic_stream_id(intr);
+
+   /* Another stream than 0 only feeds transform feedback. */
+   if (stream != 0 && !st->xfb_dwords)
+      return;
 
    /* nir_lower_gs_intrinsics passes end_primitive_with_counter(count, count_per_primitive):
     * src[0] is the RUNNING TOTAL of vertices emitted by this invocation so far, and src[1] is
@@ -699,7 +772,7 @@ lower_end_primitive(nir_builder *b, nir_intrinsic_instr *intr, struct lower_gs_s
    nir_def *nprims =
       nir_imax(b, nir_iadd_imm(b, vtx_in_prim, -(int)(vpp - 1)), nir_imm_int(b, 0));
 
-   nir_def *prim_base = nir_load_var(b, st->prims_written);
+   nir_def *prim_base = nir_load_var(b, st->prims_written[stream]);
 
    nir_variable *i =
       nir_local_variable_create(b->impl, glsl_uint_type(), "gs_strip_i");
@@ -712,9 +785,7 @@ lower_end_primitive(nir_builder *b, nir_intrinsic_instr *intr, struct lower_gs_s
       nir_jump(b, nir_jump_break);
       nir_pop_if(b, NULL);
 
-      nir_def *idx_slot =
-         nir_iadd(b, st->out_idx_base,
-                  nir_imul_imm(b, nir_iadd(b, prim_base, iv), vpp));
+      nir_def *idx_entry = nir_imul_imm(b, nir_iadd(b, prim_base, iv), vpp);
 
       for (unsigned k = 0; k < vpp; k++) {
          /* Strip winding: every other triangle in a strip is reversed, and the tiler is drawing
@@ -723,8 +794,7 @@ lower_end_primitive(nir_builder *b, nir_intrinsic_instr *intr, struct lower_gs_s
          if (vpp == 3 && k != 0)
             src = k; /* order fixed up by the parity term below */
 
-         nir_def *vbase = nir_iadd(b, st->out_vtx_base,
-                                   nir_iadd(b, vtx_start, iv));
+         nir_def *vbase = stream_vtx_slot(b, st, stream, nir_iadd(b, vtx_start, iv));
          nir_def *v = nir_iadd_imm(b, vbase, src);
          if (vpp == 3 && k != 0) {
             nir_def *odd = nir_iand_imm(b, iv, 1);
@@ -732,9 +802,7 @@ lower_end_primitive(nir_builder *b, nir_intrinsic_instr *intr, struct lower_gs_s
             v = nir_bcsel(b, nir_ine_imm(b, odd, 0), swapped, v);
          }
 
-         nir_def *addr =
-            nir_iadd(b, st->out_index,
-                     nir_u2u64(b, nir_imul_imm(b, nir_iadd_imm(b, idx_slot, k), 4)));
+         nir_def *addr = stream_index_entry(b, st, stream, nir_iadd_imm(b, idx_entry, k));
          nir_store_global(b, v, addr, .align_mul = 4, .write_mask = 0x1);
       }
 
@@ -742,14 +810,13 @@ lower_end_primitive(nir_builder *b, nir_intrinsic_instr *intr, struct lower_gs_s
    }
    nir_pop_loop(b, NULL);
 
-   nir_store_var(b, st->prims_written, nir_iadd(b, prim_base, nprims), 1);
+   nir_store_var(b, st->prims_written[stream], nir_iadd(b, prim_base, nprims), 1);
 
    /* Transform feedback reads the count after the job, so keep it current at every EndPrimitive:
     * a shader that returns early still leaves the right number behind. */
    if (st->xfb_dwords) {
       nir_push_if(b, nir_ine_imm(b, st->xfb_counts, 0));
-      nir_store_global(b, nir_iadd(b, prim_base, nprims),
-                       nir_iadd(b, st->xfb_counts, nir_u2u64(b, nir_imul_imm(b, st->gid, 4))),
+      nir_store_global(b, nir_iadd(b, prim_base, nprims), stream_count_addr(b, st, stream),
                        .align_mul = 4, .write_mask = 0x1);
       nir_pop_if(b, NULL);
    }
@@ -844,17 +911,22 @@ panvk_nir_lower_gs(struct nir_shader *nir, const struct panvk_gs_lower_options *
       nir_builder b = nir_builder_create(impl);
       nir_foreach_pred(pred, impl->end_block) {
          b.cursor = nir_after_block_before_jump(pred);
-         nir_end_primitive(&b, .stream_id = 0);
+         u_foreach_bit(s, opts->stream_mask | 1)
+            nir_end_primitive(&b, .stream_id = s);
       }
       nir_progress(true, impl, nir_metadata_control_flow);
    }
 
    /* Give every EmitVertex/EndPrimitive a running counter, and make an incomplete trailing
     * primitive discard itself rather than emit garbage. */
+   /* nir_lower_gs_intrinsics sizes its per-stream counters from this, and nothing has gathered
+    * it yet here. */
+   nir->info.gs.active_stream_mask = opts->stream_mask | 1;
    NIR_PASS(_, nir, nir_lower_gs_intrinsics,
             nir_lower_gs_intrinsics_count_primitives |
                nir_lower_gs_intrinsics_count_vertices_per_primitive |
-               nir_lower_gs_intrinsics_overwrite_incomplete);
+               nir_lower_gs_intrinsics_overwrite_incomplete |
+               ((opts->stream_mask & ~1u) ? nir_lower_gs_intrinsics_per_stream : 0));
 
    /* NOT nir_lower_io_vars_to_temporaries here. That pass has the body write temporaries and
     * copies them into the real outputs once, at the end of the shader -- which is exactly wrong
@@ -877,9 +949,11 @@ panvk_nir_lower_gs(struct nir_shader *nir, const struct panvk_gs_lower_options *
 
    struct lower_gs_state st = { .opts = opts };
 
-   st.prims_written =
-      nir_local_variable_create(impl, glsl_uint_type(), "gs_prims_written");
-   nir_store_var(&b, st.prims_written, nir_imm_int(&b, 0), 1);
+   for (unsigned s = 0; s < 4; s++) {
+      st.prims_written[s] =
+         nir_local_variable_create(impl, glsl_uint_type(), "gs_prims_written");
+      nir_store_var(&b, st.prims_written[s], nir_imm_int(&b, 0), 1);
+   }
 
    nir_def *in_pos_direct = load_param_u64(&b, opts, offsetof(struct panvk_gs_push, in_pos));
    nir_def *in_general_direct =
@@ -951,16 +1025,22 @@ panvk_nir_lower_gs(struct nir_shader *nir, const struct panvk_gs_lower_options *
    if (st.xfb_dwords) {
       st.xfb_counts = load_param_u64(&b, opts, offsetof(struct panvk_gs_push, xfb_counts));
       st.xfb_staging = load_param_u64(&b, opts, offsetof(struct panvk_gs_push, xfb_staging));
+      st.stream_slots = load_param_u32(&b, opts, offsetof(struct panvk_gs_push, xfb_stream_slots));
+      st.stream_idx = load_param_u32(&b, opts, offsetof(struct panvk_gs_push, xfb_stream_idx));
+      st.stream_index = load_param_u64(&b, opts, offsetof(struct panvk_gs_push, xfb_stream_index));
+      st.xfb_invocations =
+         load_param_u32(&b, opts, offsetof(struct panvk_gs_push, xfb_invocations));
       nir_push_if(&b, nir_ine_imm(&b, st.xfb_counts, 0));
-      nir_store_global(&b, nir_imm_int(&b, 0),
-                       nir_iadd(&b, st.xfb_counts, nir_u2u64(&b, nir_imul_imm(&b, gid, 4))),
-                       .align_mul = 4, .write_mask = 0x1);
+      u_foreach_bit(s, opts->stream_mask | 1)
+         nir_store_global(&b, nir_imm_int(&b, 0), stream_count_addr(&b, &st, s), .align_mul = 4,
+                          .write_mask = 0x1);
       nir_pop_if(&b, NULL);
    }
 
    /* An indirect draw: the real parameters are in the argument buffer, and where the vertex
     * shader wrote is in the descriptors the draw helper patched. */
    nir_def *prims_per_instance, *actual_prims;
+   nir_def *bias_direct = load_direct_bias(&b, opts, st.index_size);
    nir_push_if(&b, nir_ine_imm(&b, indirect_cmd, 0));
    nir_def *ppi_ind, *total_ind, *index_buf_ind, *stride_ind, *bias_ind, *pos_ind, *gen_ind;
    {
@@ -992,7 +1072,7 @@ panvk_nir_lower_gs(struct nir_shader *nir, const struct panvk_gs_lower_options *
    actual_prims = nir_if_phi(&b, total_ind, num_prims);
    st.index_buf = nir_if_phi(&b, index_buf_ind, index_buf_direct);
    st.instance_stride = nir_if_phi(&b, stride_ind, instance_stride_direct);
-   st.index_bias = nir_if_phi(&b, bias_ind, nir_imm_int(&b, 0));
+   st.index_bias = nir_if_phi(&b, bias_ind, bias_direct);
    st.in_pos = nir_if_phi(&b, pos_ind, in_pos_direct);
    st.in_general = nir_if_phi(&b, gen_ind, in_general_direct);
 
@@ -1150,12 +1230,13 @@ panvk_nir_lower_tcs_inputs(nir_shader *nir, const struct panvk_gs_lower_options 
    /* An indirect draw, read as panvk_nir_lower_gs reads one. The grid is right already:
     * panlib_tess_setup_indirect patched it. */
    nir_def *indirect_cmd = load_param_u64(&b, opts, offsetof(struct panvk_gs_push, indirect_cmd));
+   nir_def *bias_direct = load_direct_bias(&b, opts, st.index_size);
    nir_push_if(&b, nir_ine_imm(&b, indirect_cmd, 0));
    const struct indirect_inputs in =
       load_indirect_inputs(&b, opts, indirect_cmd, index_buf, st.index_size);
    nir_pop_if(&b, NULL);
    st.index_buf = nir_if_phi(&b, in.index_buf, index_buf);
-   st.index_bias = nir_if_phi(&b, in.bias, nir_imm_int(&b, 0));
+   st.index_bias = nir_if_phi(&b, in.bias, bias_direct);
    st.instance_stride = nir_if_phi(&b, in.stride, instance_stride);
    st.in_pos = nir_if_phi(&b, in.pos, in_pos);
    st.in_general = nir_if_phi(&b, in.gen, in_general);

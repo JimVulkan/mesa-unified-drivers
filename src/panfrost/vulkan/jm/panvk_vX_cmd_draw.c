@@ -32,6 +32,7 @@
 #include "draw_helper.h"
 #include "poly/geometry.h"
 #include "poly/tessellator.h"
+#include "kmod/kbase_kmod.h"
 #include "pan_desc.h"
 #include "pan_earlyzs.h"
 #include "pan_encoder.h"
@@ -48,6 +49,9 @@ struct panvk_draw_data {
    struct panvk_draw_info info;
    /* Indexed indirect draws: where the index search helper leaves the smallest index. */
    uint64_t index_min_addr;
+   /* The smallest index of a direct draw whose indices were read on the CPU, which the vertex
+    * job starts at; the emulated stages subtract it through index_min_addr. */
+   uint32_t cpu_index_min;
    /* prepare_vs_attribs allocated new image tables for the vertex shader. */
    bool vs_img_tables_new;
    unsigned vertex_range;
@@ -712,16 +716,31 @@ panvk_draw_prepare_varyings(struct panvk_cmd_buffer *cmdbuf,
       cmdbuf->state.gfx.gs.xfb_counts = 0;
       cmdbuf->state.gfx.gs.xfb_staging = 0;
       cmdbuf->state.gfx.gs.xfb_invocations = 0;
+      cmdbuf->state.gfx.gs.xfb_stream_index = 0;
+      cmdbuf->state.gfx.gs.xfb_stream_slots = 0;
+      cmdbuf->state.gfx.gs.xfb_stream_idx = 0;
       if (cmdbuf->state.gfx.xfb.active && gs->gs.xfb_dwords && draw->info.layer_id == 0 &&
           in_prims) {
-         struct pan_ptr counts = panvk_cmd_alloc_dev_mem(cmdbuf, desc, in_prims * 4, 4);
+         /* geometryStreams: every stream up to the last one emitted on gets its own copy of the
+          * vertex slots, counts and (past stream 0) index lists. */
+         const unsigned nstreams = util_last_bit(gs->gs.stream_mask);
+         const uint32_t slots = MAX2(out_verts, 1);
+         const uint32_t idx = in_prims * gs->gs.max_output_prims * gs->gs.output_verts_per_prim;
+         struct pan_ptr counts =
+            panvk_cmd_alloc_dev_mem(cmdbuf, desc, nstreams * in_prims * 4, 4);
          struct pan_ptr staging = panvk_cmd_alloc_dev_mem(
-            cmdbuf, desc, MAX2(out_verts, 1) * gs->gs.xfb_dwords * 4, 4);
-         if (!counts.gpu || !staging.gpu)
+            cmdbuf, desc, nstreams * slots * gs->gs.xfb_dwords * 4, 4);
+         struct pan_ptr stream_index = {0};
+         if (nstreams > 1)
+            stream_index = panvk_cmd_alloc_dev_mem(cmdbuf, desc, (nstreams - 1) * idx * 4, 4);
+         if (!counts.gpu || !staging.gpu || (nstreams > 1 && !stream_index.gpu))
             return VK_ERROR_OUT_OF_DEVICE_MEMORY;
          cmdbuf->state.gfx.gs.xfb_counts = counts.gpu;
          cmdbuf->state.gfx.gs.xfb_staging = staging.gpu;
          cmdbuf->state.gfx.gs.xfb_invocations = in_prims;
+         cmdbuf->state.gfx.gs.xfb_stream_index = stream_index.gpu;
+         cmdbuf->state.gfx.gs.xfb_stream_slots = slots;
+         cmdbuf->state.gfx.gs.xfb_stream_idx = idx;
       }
 
       /* Bisect switches, read once so they cannot cost anything on the default path. */
@@ -2021,7 +2040,7 @@ emit_gs_job(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw,
          in_cmd = scratch.gpu;
          index_min = scratch.gpu + 60;
       }
-      memset((uint8_t *)scratch.cpu + 60, 0, 4);
+      memcpy((uint8_t *)scratch.cpu + 60, &draw->cpu_index_min, 4);
       unrolled_cmd = scratch.gpu + 32;
       unrolled = scratch.gpu + 64;
 
@@ -2088,6 +2107,10 @@ emit_gs_job(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw,
                               : 0,
       .xfb_counts = tes_out ? 0 : cmdbuf->state.gfx.gs.xfb_counts,
       .xfb_staging = tes_out ? 0 : cmdbuf->state.gfx.gs.xfb_staging,
+      .xfb_stream_index = tes_out ? 0 : cmdbuf->state.gfx.gs.xfb_stream_index,
+      .xfb_stream_slots = tes_out ? 0 : cmdbuf->state.gfx.gs.xfb_stream_slots,
+      .xfb_stream_idx = tes_out ? 0 : cmdbuf->state.gfx.gs.xfb_stream_idx,
+      .xfb_invocations = tes_out ? 0 : cmdbuf->state.gfx.gs.xfb_invocations,
       /* The tess eval job leaves clip-space positions for the geometry shader job. */
       .in_screen_space =
          !tes_in && !panvk_shader_hw_variant(cmdbuf->state.gfx.vs.shader)->gs.vs_clip_space,
@@ -2282,7 +2305,7 @@ emit_tess_jobs(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw,
       .in_general_desc =
          indirect ? draw->varying_bufs + PANVK_VARY_BUF_GENERAL * pan_size(ATTRIBUTE_BUFFER) : 0,
       .vertex_dcd = indirect ? draw->jobs.vertex.gpu + pan_section_offset(COMPUTE_JOB, DRAW) : 0,
-      .index_min = indirect ? draw->index_min_addr : 0,
+      .index_min = draw->index_min_addr,
       .prims_per_instance = ppi,
       .instance_stride = instances > 1 ? draw->padded_vertex_count : 0,
       .in_screen_space =
@@ -2454,48 +2477,65 @@ emit_xfb_jobs(struct panvk_cmd_buffer *cmdbuf, unsigned dep_job_id)
       panvk_shader_only_variant(cmdbuf->state.gfx.gs.shader);
    const uint32_t n = cmdbuf->state.gfx.gs.xfb_invocations;
    const uint32_t k_dw = gs->gs.xfb_dwords;
+   const uint32_t idx_per_invocation = gs->gs.max_output_prims * gs->gs.output_verts_per_prim;
 
-   /* [draw block][16: offsets after this draw][k_dw: table][n: first primitive per invocation] */
-   struct pan_ptr mem = panvk_cmd_alloc_dev_mem(
-      cmdbuf, desc, sizeof(struct libpan_xfb_draw) + 16 + (k_dw + n) * 4, 16);
-   if (!mem.gpu)
-      return;
+   /* One scan and copy per vertex stream, each over the buffers that stream captures to (the
+    * others get stride 0, which both kernels skip), in stream order and chained through the
+    * write offsets, like consecutive draws. */
+   u_foreach_bit(s, gs->gs.stream_mask) {
+      bool captures = false;
+      for (unsigned b = 0; b < 4; b++)
+         captures |= gs->gs.xfb_strides[b] && gs->gs.xfb_buffer_stream[b] == s;
+      if (!captures)
+         continue;
 
-   const uint64_t slot = mem.gpu + sizeof(struct libpan_xfb_draw);
-   const uint64_t table = slot + 16;
-   struct libpan_xfb_draw *d = mem.cpu;
-   *d = (struct libpan_xfb_draw){
-      .offsets_in = cmdbuf->state.gfx.xfb.offsets,
-      .offsets_out = slot,
-      .counts = cmdbuf->state.gfx.gs.xfb_counts,
-      .first = table + k_dw * 4,
-      .indices = cmdbuf->state.gfx.gs.out_index,
-      .staging = cmdbuf->state.gfx.gs.xfb_staging,
-      .table = table,
-      .invocations = n,
-      .idx_per_invocation = gs->gs.max_output_prims * gs->gs.output_verts_per_prim,
-      .vpp = gs->gs.output_verts_per_prim,
-      .record_dwords = k_dw,
-   };
-   for (unsigned b = 0; b < 4; b++) {
-      d->buffer[b] = cmdbuf->state.gfx.xfb.addr[b];
-      d->size[b] = cmdbuf->state.gfx.xfb.size[b];
-      d->stride[b] = gs->gs.xfb_strides[b];
+      /* [draw block][16: offsets after this draw][k_dw: table][n: first primitive per
+       * invocation] */
+      struct pan_ptr mem = panvk_cmd_alloc_dev_mem(
+         cmdbuf, desc, sizeof(struct libpan_xfb_draw) + 16 + (k_dw + n) * 4, 16);
+      if (!mem.gpu)
+         return;
+
+      const uint64_t slot = mem.gpu + sizeof(struct libpan_xfb_draw);
+      const uint64_t table = slot + 16;
+      struct libpan_xfb_draw *d = mem.cpu;
+      *d = (struct libpan_xfb_draw){
+         .offsets_in = cmdbuf->state.gfx.xfb.offsets,
+         .offsets_out = slot,
+         .counts = cmdbuf->state.gfx.gs.xfb_counts + (uint64_t)s * n * 4,
+         .first = table + k_dw * 4,
+         .indices = s ? cmdbuf->state.gfx.gs.xfb_stream_index +
+                           (uint64_t)(s - 1) * cmdbuf->state.gfx.gs.xfb_stream_idx * 4
+                      : cmdbuf->state.gfx.gs.out_index,
+         .staging = cmdbuf->state.gfx.gs.xfb_staging,
+         .table = table,
+         .invocations = n,
+         .idx_per_invocation = idx_per_invocation,
+         .vpp = gs->gs.output_verts_per_prim,
+         .record_dwords = k_dw,
+      };
+      for (unsigned b = 0; b < 4; b++) {
+         d->buffer[b] = cmdbuf->state.gfx.xfb.addr[b];
+         d->size[b] = cmdbuf->state.gfx.xfb.size[b];
+         d->stride[b] = gs->gs.xfb_buffer_stream[b] == s ? gs->gs.xfb_strides[b] : 0;
+      }
+      memcpy((uint8_t *)mem.cpu + sizeof(struct libpan_xfb_draw) + 16, gs->gs.xfb_table,
+             k_dw * 4);
+      cmdbuf->state.gfx.xfb.offsets = slot;
+
+      struct panvk_precomp_ctx precomp_ctx = panvk_per_arch(precomp_cs)(cmdbuf);
+      const struct panlib_xfb_scan_args scan = {.d = mem.gpu};
+      panlib_xfb_scan_struct(&precomp_ctx,
+                             panlib_1d_with_jm_deps(1, dep_job_id, cmdbuf->state.gfx.xfb.last_job),
+                             PANLIB_BARRIER_JM_BARRIER, scan);
+      const unsigned scanned = emit_cache_flush_job(cmdbuf, batch->vtc_jc.job_index);
+
+      const struct panlib_xfb_copy_args copy = {.d = mem.gpu};
+      panlib_xfb_copy_struct(&precomp_ctx,
+                             panlib_1d_with_jm_deps(DIV_ROUND_UP(n, 64), scanned, 0),
+                             PANLIB_BARRIER_JM_BARRIER, copy);
+      cmdbuf->state.gfx.xfb.last_job = emit_cache_flush_job(cmdbuf, batch->vtc_jc.job_index);
    }
-   memcpy((uint8_t *)mem.cpu + sizeof(struct libpan_xfb_draw) + 16, gs->gs.xfb_table, k_dw * 4);
-   cmdbuf->state.gfx.xfb.offsets = slot;
-
-   struct panvk_precomp_ctx precomp_ctx = panvk_per_arch(precomp_cs)(cmdbuf);
-   const struct panlib_xfb_scan_args scan = {.d = mem.gpu};
-   panlib_xfb_scan_struct(&precomp_ctx,
-                          panlib_1d_with_jm_deps(1, dep_job_id, cmdbuf->state.gfx.xfb.last_job),
-                          PANLIB_BARRIER_JM_BARRIER, scan);
-   const unsigned scanned = emit_cache_flush_job(cmdbuf, batch->vtc_jc.job_index);
-
-   const struct panlib_xfb_copy_args copy = {.d = mem.gpu};
-   panlib_xfb_copy_struct(&precomp_ctx, panlib_1d_with_jm_deps(DIV_ROUND_UP(n, 64), scanned, 0),
-                          PANLIB_BARRIER_JM_BARRIER, copy);
-   cmdbuf->state.gfx.xfb.last_job = emit_cache_flush_job(cmdbuf, batch->vtc_jc.job_index);
 }
 
 /*
@@ -2970,6 +3010,80 @@ direct_indexed_vertex_range(struct panvk_cmd_buffer *cmdbuf,
    return MAX2(range, index_count);
 }
 
+/* The indices live in an uncached mapping, where every load waits on memory: copy them out in
+ * bulk (memcpy moves 32 bytes per load pair and keeps several in flight), then take min and max
+ * from the cached copy in a loop the compiler vectorises. A restart index, the largest value of
+ * the type, is left out of the maximum by folding it to 0; it can only be the minimum when it is
+ * the only value, which the caller turns into an empty draw. */
+#define INDEX_SCAN(T)                                                          \
+   static void index_scan_##T(const T *src, uint32_t count, bool restart,     \
+                              uint32_t *lo, uint32_t *hi)                     \
+   {                                                                           \
+      const T rst = (T)~(T)0;                                                  \
+      T l = rst, h = 0, hr = 0;                                                \
+      T chunk[4096 / sizeof(T)];                                               \
+      for (uint32_t base = 0; base < count; base += ARRAY_SIZE(chunk)) {       \
+         const uint32_t n = MIN2(count - base, ARRAY_SIZE(chunk));             \
+         memcpy(chunk, src + base, n * sizeof(T));                             \
+         for (uint32_t i = 0; i < n; i++) {                                    \
+            const T v = chunk[i];                                              \
+            const T vr = v == rst ? 0 : v;                                     \
+            l = v < l ? v : l;                                                 \
+            h = v > h ? v : h;                                                 \
+            hr = vr > hr ? vr : hr;                                            \
+         }                                                                     \
+      }                                                                        \
+      if (!restart) {                                                          \
+         *lo = l;                                                              \
+         *hi = h;                                                              \
+      } else if (l != rst) {                                                   \
+         *lo = l;                                                              \
+         *hi = hr;                                                             \
+      }                                                                        \
+   }
+INDEX_SCAN(uint8_t)
+INDEX_SCAN(uint16_t)
+INDEX_SCAN(uint32_t)
+#undef INDEX_SCAN
+
+/* The [min, max] of the indices a direct indexed draw reads, from the CPU, when the bound index
+ * buffer allows it (see ib.cpu_readable). The vertex job then shades exactly that range. Without
+ * it, a draw out of a big streaming vertex buffer shades everything from vertexOffset to the end
+ * of the buffer: PCSX2 (ARMSX2) draws from a 32 MB ring, and its small sprite draws allocated up
+ * to 4 MB of varyings each, 2.4 GB in flight, until the process was killed for memory. Returns
+ * false when the scan cannot be done; min > max when every index is a restart index. */
+static bool
+cpu_index_range(struct panvk_cmd_buffer *cmdbuf, uint32_t first, uint32_t count,
+                uint32_t *min_out, uint32_t *max_out)
+{
+   const uint32_t isz = cmdbuf->state.gfx.ib.index_size;
+
+   if (!cmdbuf->state.gfx.ib.cpu_readable ||
+       ((uint64_t)first + count) * isz > cmdbuf->state.gfx.ib.size)
+      return false;
+
+   const void *p =
+      (const void *)(uintptr_t)(cmdbuf->state.gfx.ib.dev_addr + (uint64_t)first * isz);
+   const bool restart =
+      cmdbuf->vk.dynamic_graphics_state.ia.primitive_restart_enable;
+
+   *min_out = UINT32_MAX;
+   *max_out = 0;
+   switch (isz) {
+   case 1:
+      index_scan_uint8_t(p, count, restart, min_out, max_out);
+      return true;
+   case 2:
+      index_scan_uint16_t(p, count, restart, min_out, max_out);
+      return true;
+   case 4:
+      index_scan_uint32_t(p, count, restart, min_out, max_out);
+      return true;
+   default:
+      return false;
+   }
+}
+
 VKAPI_ATTR void VKAPI_CALL
 panvk_per_arch(CmdDrawIndexed)(VkCommandBuffer commandBuffer,
                                uint32_t indexCount, uint32_t instanceCount,
@@ -2988,6 +3102,44 @@ panvk_per_arch(CmdDrawIndexed)(VkCommandBuffer commandBuffer,
    /* A direct indexed draw knows all of its own parameters, so it is emitted by the CPU like
     * vkCmdDraw is, rather than being turned into a synthetic indirect draw for a GPU helper to
     * resolve. See is_indirect_draw() for what that helper does not manage to do here. */
+   uint32_t min_index, max_index;
+   if (cpu_index_range(cmdbuf, firstIndex, indexCount, &min_index, &max_index) &&
+       (min_index > max_index || max_index - min_index < (1u << 24))) {
+      if (min_index > max_index)
+         return;
+
+      /* The vertex job starts at vertexOffset + min_index, and base_vertex_offset
+       * (base - raw_offset = -min_index) maps index i back to varying slot i - min_index. */
+      const uint32_t range = max_index - min_index + 1;
+      struct panvk_draw_data draw = {
+         .info = {
+            .index = panvk_draw_info_index(cmdbuf, firstIndex),
+            .vertex.base = vertexOffset,
+            .vertex.raw_offset = vertexOffset + (int32_t)min_index,
+            .vertex.count = indexCount,
+            .instance.base = firstInstance,
+            .instance.count = instanceCount,
+            .prim = panvk_get_client_prim(cmdbuf),
+         },
+         .vertex_range = range,
+         .padded_vertex_count = padded_vertex_count(cmdbuf, range, instanceCount),
+         .cpu_index_min = min_index,
+      };
+
+      /* The emulated geometry and tessellation stages index the vertex shader's output by
+       * index - min, and read min from memory as they do after the GPU scan. */
+      if (min_index) {
+         struct pan_ptr m = panvk_cmd_alloc_dev_mem(cmdbuf, desc, 4, 4);
+         if (!m.gpu)
+            return;
+         *(uint32_t *)m.cpu = min_index;
+         draw.index_min_addr = m.gpu;
+      }
+
+      panvk_cmd_draw(cmdbuf, &draw);
+      return;
+   }
+
    const uint32_t vertex_range =
       direct_indexed_vertex_range(cmdbuf, indexCount, vertexOffset);
 
