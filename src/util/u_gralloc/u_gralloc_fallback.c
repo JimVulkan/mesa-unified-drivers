@@ -205,6 +205,25 @@ static const int arm_hnd_plane0[] = {15 /* Exynos */, 21 /* MediaTek */};
 #define ARM_HND_PLANE_INTS       3  /* plane_info[3] of {byte stride, width, height} */
 #define ARM_HND_MIN_INTS         36
 #define ARM_ALLOC_FORMAT_AFBC    (1ull << 32)
+/* MediaTek's allocator gives GPU-only buffers (sampled + framebuffer, no CPU or composer usage)
+ * alloc format 0x311_<hal format>, whatever the size: AFBC with 16x16 superblocks, headers tiled
+ * 8x8 (so 128x128-pixel aligned), YUV transform and sparse bodies, the header at offset 0 and the
+ * body right after it on a 4 KB boundary. That is the layout Mesa computes for the equivalent DRM
+ * modifier, and the plane stride is the uncompressed byte stride of the aligned width, which is
+ * what the AFBC import takes as its row pitch. Read off probe/mali/ahbdump.c at 16x16 to
+ * 1920x1080 and checked pixel for pixel in both directions against the vendor GLES driver
+ * (probe/mali/vkafbc.c). Only this combination, and only RGBA/RGBX 8888, is taken as AFBC.
+ * A BGRA 8888 request is stored as RGBA AFBC (alloc format 0x311_00000001), so it is reported
+ * as RGBA, which is also the Vulkan format the vendor driver gives such a buffer. */
+#define ARM_MTK_AFBC_ALLOC_BITS  0x311u
+/* Exynos's allocator (Galaxy S10e, Android 12) makes the same GPU-only buffers AFBC with alloc
+ * format 0x1_<hal format>: 16x16 superblocks, untiled headers, no YUV transform, the plane stride
+ * that of the 16-aligned width. Its body starts at the header size rounded up to 4 KB where Mesa
+ * uses 128 bytes; readers follow the header's offsets and Mesa's body ends inside the buffer, so
+ * that does not matter. Checked like the MediaTek layout (probe/mali/vkafbc.c): 16x16 + sparse
+ * passes both directions, with YUV transform every pixel is wrong. A BGRA 8888 buffer is stored in
+ * RGBA component order here too (alloc format 0x1_00000005), as the vendor driver reports it. */
+#define ARM_EXYNOS_AFBC_ALLOC_BITS 0x1u
 
 /* Returns -ENOENT when the handle is not an ARM gralloc handle. */
 static int
@@ -254,17 +273,45 @@ arm_gralloc_get_buffer_info(struct u_gralloc_buffer_handle *hnd,
       return -EINVAL;
    }
 
-   /* AFBC's header and body placement is the allocator's, and nothing here describes it, so a
-    * compressed buffer is refused rather than read as linear. Swapchain images avoid it by
-    * asking for MALI_GRALLOC_USAGE_NO_AFBC and composer usage (see the driver's swapchain
-    * gralloc usage). */
+   /* Other AFBC layouts are the allocator's, and nothing here describes them, so such a buffer
+    * is refused rather than read as linear. Swapchain images and the driver's own
+    * AHardwareBuffers avoid AFBC by asking for MALI_GRALLOC_USAGE_NO_AFBC and composer usage. */
+   uint64_t modifier = DRM_FORMAT_MOD_LINEAR;
+   int stored_format = format;
    if (alloc_format & ARM_ALLOC_FORMAT_AFBC) {
-      mesa_loge("ARM gralloc: AFBC buffer (alloc format 0x%" PRIx64 ") is not handled",
-                alloc_format);
-      return -EINVAL;
+      const uint32_t alloc_hal = (uint32_t)alloc_format;
+      const bool mtk_afbc = plane0 == arm_hnd_plane0[1] &&
+                            (alloc_format >> 32) == ARM_MTK_AFBC_ALLOC_BITS &&
+                            ((alloc_hal == (uint32_t)format &&
+                              (format == HAL_PIXEL_FORMAT_RGBA_8888 ||
+                               format == HAL_PIXEL_FORMAT_RGBX_8888)) ||
+                             (alloc_hal == HAL_PIXEL_FORMAT_RGBA_8888 &&
+                              format == HAL_PIXEL_FORMAT_BGRA_8888));
+      const bool exy_afbc = plane0 == arm_hnd_plane0[0] &&
+                            (alloc_format >> 32) == ARM_EXYNOS_AFBC_ALLOC_BITS &&
+                            alloc_hal == (uint32_t)format &&
+                            (format == HAL_PIXEL_FORMAT_RGBA_8888 ||
+                             format == HAL_PIXEL_FORMAT_RGBX_8888 ||
+                             format == HAL_PIXEL_FORMAT_BGRA_8888);
+      if (!mtk_afbc && !exy_afbc) {
+         mesa_loge("ARM gralloc: AFBC buffer (alloc format 0x%" PRIx64 ") is not handled",
+                   alloc_format);
+         return -EINVAL;
+      }
+      if (mtk_afbc) {
+         modifier = DRM_FORMAT_MOD_ARM_AFBC(AFBC_FORMAT_MOD_BLOCK_SIZE_16x16 |
+                                            AFBC_FORMAT_MOD_TILED | AFBC_FORMAT_MOD_YTR |
+                                            AFBC_FORMAT_MOD_SPARSE);
+         stored_format = alloc_hal;
+      } else {
+         modifier = DRM_FORMAT_MOD_ARM_AFBC(AFBC_FORMAT_MOD_BLOCK_SIZE_16x16 |
+                                            AFBC_FORMAT_MOD_SPARSE);
+         stored_format = format == HAL_PIXEL_FORMAT_BGRA_8888 ? HAL_PIXEL_FORMAT_RGBA_8888
+                                                              : format;
+      }
    }
 
-   const int drm_fourcc = get_fourcc_from_hal_format(format);
+   const int drm_fourcc = get_fourcc_from_hal_format(stored_format);
    if (drm_fourcc == -1 || !bpp || !width || stride < width * bpp || stride > INT32_MAX) {
       mesa_loge("ARM gralloc: inconsistent handle (format 0x%x, %ux%u, stride %u)", format,
                 width, height, stride);
@@ -286,7 +333,7 @@ arm_gralloc_get_buffer_info(struct u_gralloc_buffer_handle *hnd,
    }
 
    out->drm_fourcc = drm_fourcc;
-   out->modifier = DRM_FORMAT_MOD_LINEAR;
+   out->modifier = modifier;
    out->num_planes = 1;
    out->fds[0] = fd;
    out->offsets[0] = 0;

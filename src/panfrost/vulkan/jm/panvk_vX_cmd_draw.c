@@ -1827,10 +1827,16 @@ prepare_draw_layer(struct panvk_cmd_buffer *cmdbuf,
       if (result != VK_SUCCESS)
          return result;
 
+      /* Without a geometry or tessellation stage the tiler reads the vertex shader's positions.
+       * A vertex shader that writes none leaves them undefined, so nothing is rasterized, as on
+       * the vendor driver, rather than the tiler reading whatever the buffer held. */
+      const bool writes_pos =
+         cmdbuf->state.gfx.gs.shader ||
+         pan_varying_layout_find_slot(&vs->info.varyings.formats, VARYING_SLOT_POS);
       bool needs_tiling =
-         !cmdbuf->vk.dynamic_graphics_state.rs.rasterizer_discard_enable ||
-         cmdbuf->state.gfx.occlusion_query.mode !=
-            MALI_OCCLUSION_MODE_DISABLED;
+         writes_pos &&
+         (!cmdbuf->vk.dynamic_graphics_state.rs.rasterizer_discard_enable ||
+          cmdbuf->state.gfx.occlusion_query.mode != MALI_OCCLUSION_MODE_DISABLED);
 
       if (needs_tiling) {
          result = panvk_draw_prepare_tiler_job(cmdbuf, draw);

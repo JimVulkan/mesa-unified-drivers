@@ -2861,8 +2861,12 @@ panvk_per_arch(link_shaders)(struct panvk_pool *desc_pool,
    const struct pan_varying_slot *vs_psiz_slot =
       pan_varying_layout_find_slot(vs_layout, VARYING_SLOT_PSIZ);
 
+   /* The position buffer exists even when the vertex shader writes no gl_Position, which is how
+    * DXVK compiles a D3D vertex shader without SV_Position (one that feeds a hull or geometry
+    * shader, or stream output only): the vertex job accesses it regardless, and a NULL buffer
+    * page-faults, which kills every job of the context. */
+   buf_strides[PANVK_VARY_BUF_POSITION] = sizeof(uint32_t) * 4;
    if (vs_pos_slot) {
-      buf_strides[PANVK_VARY_BUF_POSITION] = sizeof(uint32_t) * 4;
       buf_sizes[VARYING_SLOT_POS] =
          nir_alu_type_get_type_size(vs_pos_slot->alu_type);
    }

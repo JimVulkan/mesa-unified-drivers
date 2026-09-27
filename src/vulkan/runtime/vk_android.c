@@ -189,6 +189,41 @@ vk_gralloc_to_drm_explicit_layout(
    return VK_SUCCESS;
 }
 
+/* The dma-buf is not always the handle's first fd: MediaTek's ARM gralloc handle carries three,
+ * the first is -1 and the buffer is the second. The gralloc backend that parsed the handle knows
+ * which, so ask it, and fall back to the first fd.
+ */
+int
+vk_android_native_handle_dma_buf_fd(const struct native_handle *handle,
+                                    int hal_format, int pixel_stride)
+{
+   assert(handle && handle->numFds > 0);
+   struct u_gralloc *gralloc = vk_android_get_ugralloc();
+   if (gralloc) {
+      struct u_gralloc_buffer_handle gr_handle = {
+         .handle = handle,
+         .hal_format = hal_format,
+         .pixel_stride = pixel_stride,
+      };
+      struct u_gralloc_buffer_basic_info info = {0};
+      if (u_gralloc_get_buffer_basic_info(gralloc, &gr_handle, &info) == 0 &&
+          info.fds[0] > 0)
+         return info.fds[0];
+   }
+   return handle->data[0];
+}
+
+#if ANDROID_API_LEVEL >= 26
+int
+vk_android_ahb_dma_buf_fd(const struct AHardwareBuffer *ahb)
+{
+   AHardwareBuffer_Desc desc;
+   AHardwareBuffer_describe(ahb, &desc);
+   return vk_android_native_handle_dma_buf_fd(
+      AHardwareBuffer_getNativeHandle(ahb), desc.format, desc.stride);
+}
+#endif
+
 VkResult
 vk_android_import_anb_memory(struct vk_device *device,
                              struct vk_image *image,
@@ -197,21 +232,8 @@ vk_android_import_anb_memory(struct vk_device *device,
 {
    assert(anb && anb->handle && anb->handle->numFds > 0);
 
-   int dma_buf_fd = anb->handle->data[0];
-
-   /* The dma-buf is not always the handle's first fd: MediaTek's ARM gralloc handle carries three
-    * and the buffer is the second. The gralloc backend that parsed the handle knows which. */
-   struct u_gralloc *gralloc = vk_android_get_ugralloc();
-   if (gralloc) {
-      struct u_gralloc_buffer_handle gr_handle = {
-         .handle = anb->handle,
-         .hal_format = anb->format,
-         .pixel_stride = anb->stride,
-      };
-      struct u_gralloc_buffer_basic_info info = {0};
-      if (u_gralloc_get_buffer_basic_info(gralloc, &gr_handle, &info) == 0 && info.fds[0] > 0)
-         dma_buf_fd = info.fds[0];
-   }
+   int dma_buf_fd =
+      vk_android_native_handle_dma_buf_fd(anb->handle, anb->format, anb->stride);
 
    /* Query image memory requirements for size and supported memory types */
    VkMemoryRequirements mem_reqs;
@@ -801,7 +823,8 @@ vk_image_usage_to_ahb_usage(const VkImageCreateFlags2KHR vk_create,
 static bool
 vk_ahb_probe_format(VkFormat vk_format,
                     VkImageCreateFlags vk_create,
-                    VkImageUsageFlags vk_usage)
+                    VkImageUsageFlags vk_usage,
+                    uint64_t extra_usage)
 {
    const uint32_t ahb_format = vk_image_format_to_ahb_format(vk_format);
    if (!ahb_format)
@@ -812,7 +835,7 @@ vk_ahb_probe_format(VkFormat vk_format,
       .height = 16,
       .layers = 1,
       .format = ahb_format,
-      .usage = vk_image_usage_to_ahb_usage(vk_create, vk_usage),
+      .usage = vk_image_usage_to_ahb_usage(vk_create, vk_usage) | extra_usage,
    };
 #if ANDROID_API_LEVEL >= 29
    return AHardwareBuffer_isSupported(&desc);
@@ -855,7 +878,8 @@ vk_alloc_ahardware_buffer(const VkMemoryAllocateInfo *pAllocateInfo)
       layers = image->array_layers;
       format = image->ahb_format;
       usage = vk_image_usage_to_ahb_usage(image->create_flags,
-                                          image->usage);
+                                          image->usage) |
+              image->base.device->physical->android_ahb_image_usage;
    } else {
       /* AHB export allocation for VkBuffer requires a valid allocationSize */
       assert(pAllocateInfo->allocationSize);
@@ -925,6 +949,22 @@ get_ahb_buffer_format_properties2(
    VkFormatProperties2 format_properties = {.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2};
 
    p->format = vk_ahb_format_to_image_format(desc.format);
+
+   /* An allocator may store a BGRA buffer as RGBA: MediaTek's ARM gralloc does for GPU-only
+    * (AFBC) buffers, where only the component order in the descriptor tells them apart. Report
+    * the format the buffer is stored in, as the vendor driver there does. */
+   if (p->format == VK_FORMAT_B8G8R8A8_UNORM && vk_android_get_ugralloc()) {
+      struct u_gralloc_buffer_handle bgra_handle = {
+         .handle = AHardwareBuffer_getNativeHandle(buffer),
+         .pixel_stride = desc.stride,
+         .hal_format = desc.format,
+      };
+      struct u_gralloc_buffer_basic_info bgra_info = {0};
+      if (u_gralloc_get_buffer_basic_info(vk_android_get_ugralloc(), &bgra_handle,
+                                          &bgra_info) == 0 &&
+          bgra_info.drm_fourcc == DRM_FORMAT_ABGR8888)
+         p->format = VK_FORMAT_R8G8B8A8_UNORM;
+   }
 
    VkFormat external_format = p->format;
 
@@ -1100,15 +1140,14 @@ vk_common_GetAndroidHardwareBufferPropertiesANDROID(
       }
    }
 
-   const native_handle_t *handle = AHardwareBuffer_getNativeHandle(buffer);
-   assert(handle && handle->numFds > 0);
-   pProperties->allocationSize = lseek(handle->data[0], 0, SEEK_END);
+   const int dma_buf_fd = vk_android_ahb_dma_buf_fd(buffer);
+   pProperties->allocationSize = lseek(dma_buf_fd, 0, SEEK_END);
 
    VkMemoryFdPropertiesKHR fd_props = {
       .sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR,
    };
    result = device->dispatch_table.GetMemoryFdPropertiesKHR(
-      device_h, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, handle->data[0],
+      device_h, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, dma_buf_fd,
       &fd_props);
    if (result != VK_SUCCESS)
       return result;
@@ -1159,7 +1198,8 @@ vk_android_get_ahb_image_properties(
                        "type (%u) unsupported for AHB", info->type);
    }
 
-   if (!vk_ahb_probe_format(info->format, info->flags, info->usage)) {
+   if (!vk_ahb_probe_format(info->format, info->flags, info->usage,
+                            pdevice->android_ahb_image_usage)) {
       return vk_errorf(
          pdevice, VK_ERROR_FORMAT_NOT_SUPPORTED,
          "format (%u) flags (0x%x) usage (0x%x) unsupported for AHB",
@@ -1188,7 +1228,8 @@ vk_android_get_ahb_image_properties(
       VkImageUsageFlags2KHR image_usage = vk_image_format_info_2_usage(info);
 
       ahb_usage->androidHardwareBufferUsage =
-         vk_image_usage_to_ahb_usage(image_flags, image_usage);
+         vk_image_usage_to_ahb_usage(image_flags, image_usage) |
+         pdevice->android_ahb_image_usage;
    }
 
    return VK_SUCCESS;

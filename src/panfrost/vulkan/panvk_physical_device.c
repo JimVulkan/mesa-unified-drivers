@@ -29,6 +29,7 @@
 #include "vk_physical_device.h"
 #include "vk_util.h"
 
+#include "panvk_android.h"
 #include "panvk_device.h"
 #include "panvk_entrypoints.h"
 #include "panvk_image.h"
@@ -507,6 +508,12 @@ panvk_physical_device_init(struct panvk_physical_device *device,
 
    /* initialize disk cache after vk_physical_device_init */
    init_shader_caches(device, instance);
+
+   /* ARM's gralloc (kbase phones) allocates AFBC for GPU-only usage, in a layout we cannot
+    * import, so image AHardwareBuffers ask for a linear one. See panvk_android.c. */
+   if (pan_kmod_dev_is_kbase(device->kmod.dev))
+      device->vk.android_ahb_image_usage =
+         MALI_GRALLOC_USAGE_NO_AFBC | GRALLOC_USAGE_HW_COMPOSER;
 
    /* pipeline binary props rely on disk cache init state */
    panvk_arch_dispatch(arch, get_physical_device_properties, instance, device,

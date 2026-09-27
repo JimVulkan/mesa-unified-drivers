@@ -265,9 +265,7 @@ panvk_android_import_ahb_memory(VkDevice device,
                                 VkDeviceMemory *pMemory)
 {
    VK_FROM_HANDLE(vk_device, dev, device);
-   const native_handle_t *handle = AHardwareBuffer_getNativeHandle(ahb);
-   assert(handle && handle->numFds > 0);
-   int dma_buf_fd = handle->data[0];
+   int dma_buf_fd = vk_android_ahb_dma_buf_fd(ahb);
    VkResult result;
 
    VkImage img_handle = VK_NULL_HANDLE;
@@ -410,11 +408,10 @@ panvk_android_allocate_ahb_memory(VkDevice device,
  *
  * MediaTek's allocator (Galaxy A31) ignores NO_AFBC: a render + texture buffer, which is what a
  * TextureView consumer asks for, still comes back AFBC. Asking for composer usage as well makes
- * it linear there, and Exynos stays linear with it.
+ * it linear there, and Exynos stays linear with it. The same holds for the AHardwareBuffers we
+ * allocate for image memory (android_ahb_image_usage): a GPU-only one comes back AFBC on
+ * MediaTek, and importing it again, as Winlator-style wrappers do for swapchain images, failed.
  */
-#define MALI_GRALLOC_USAGE_NO_AFBC (1u << 29)
-#define GRALLOC_USAGE_HW_COMPOSER  (1u << 11)
-
 static bool
 panvk_android_is_kbase(VkDevice device)
 {
