@@ -23,6 +23,7 @@ the CPU. Nothing is shown on screen.
 | 13 | ETC2 RGB8 textures |
 | 14 | 3D ASTC texture, second slice sampled |
 | 15 | discarded pixels don't write depth (cutout grass in front of water) |
+| 16 | rendering to 1280x720 textures (big enough for render target compression) and sampling them back: RGBA8, RGBA16F, R11G11B10F and RGB10A2 after a clear and a draw, an uploaded texture, and generated mipmaps |
 
 ## Building
 

@@ -106,7 +106,10 @@ RADV. Each switch is an environment variable or, for apps that cannot set one, a
 | `debug.radv_xclipse_mtype` | `RADV_XCLIPSE_MTYPE` | VA map MTYPE: `0` default, `3` upstream |
 | `debug.radv_xclipse_pal_heaps` | `RADV_XCLIPSE_PAL_HEAPS` | `0` restores the single memory heap |
 | `debug.radv_xclipse_dcc` | `RADV_XCLIPSE_DCC` | `0` turns off render target compression (DCC) |
-| `debug.mesa_xclipse_prof` | `MESA_XCLIPSE_PROF` | `<delay>,<seconds>` profiles CPU and GPU time per frame and per render pass, then writes `mesa_prof_<pid>.txt` to `MESA_XCLIPSE_PROF_DIR` or the app's `Android/data/<package>/files` |
+| `debug.radv_xclipse_dcc_small` | `RADV_XCLIPSE_DCC_SMALL` | `0` turns off DCC for render targets of 512x512 and smaller only |
+| `debug.radv_xclipse_fillclear` | | `1` clears a whole render target that has no compression by filling its memory instead of drawing (experimental) |
+| `debug.radv_xclipse_bc5_alias` | `RADV_XCLIPSE_BC5_ALIAS` | `0` stores BC5 textures separately from their converted (EAC) copy again: twice the memory and a slower upload, but copying such a texture back out as BC5 returns the original data |
+| `debug.mesa_xclipse_prof` | `MESA_XCLIPSE_PROF` | `<delay>,<seconds>` profiles CPU and GPU time per frame and per render pass, then writes `mesa_prof_<pid>.txt` to `MESA_XCLIPSE_PROF_DIR` or the app's `Android/data/<package>/files`. `t,<seconds>` instead profiles `<seconds>` each time `debug.mesa_xclipse_prof_go` changes (`t,<seconds>,g` without CPU sampling), writes to `debug.mesa_xclipse_prof_dir` if set, and also prints the summary to logcat (tag `XPROF`) |
 
 RadeonSI:
 
@@ -116,8 +119,9 @@ RadeonSI:
 | `debug.mesa_xclipse_present_probe` | `MESA_XCLIPSE_PRESENT_PROBE` | `n` logs what every n-th presented frame contains |
 | `debug.mesa_xclipse_hnd_dump` | | `1` logs each window buffer's gralloc handle |
 | `debug.mesa_xclipse_async_present` | `MESA_XCLIPSE_ASYNC_PRESENT` | `0` presents from the app thread instead of a helper thread |
-| `debug.mesa_xclipse_prof` | `MESA_XCLIPSE_PROF` | `<delay>,<seconds>` writes a CPU/GPU profile `mesa_prof_<pid>.txt` to `MESA_XCLIPSE_PROF_DIR` (else `$TMPDIR`) |
-| `debug.mesa_xclipse_dcc` | `MESA_XCLIPSE_DCC` | render target compression (DCC): `1` on, `0` off; on by default on the Xclipse 530 only |
+| `debug.mesa_xclipse_prof` | `MESA_XCLIPSE_PROF` | `<delay>,<seconds>` writes a CPU/GPU profile `mesa_prof_<pid>.txt` to `MESA_XCLIPSE_PROF_DIR` (else `$TMPDIR`). `t,<seconds>` instead profiles `<seconds>` each time `debug.mesa_xclipse_prof_go` changes (`t,<seconds>,g` without CPU sampling), writes to `debug.mesa_xclipse_prof_dir` if set, and also prints the summary to logcat (tag `XPROF`) |
+| `debug.mesa_xclipse_dcc` | `MESA_XCLIPSE_DCC` | `0` turns off render target compression (DCC) |
+| `debug.mesa_xclipse_w32ps` | `MESA_XCLIPSE_W32PS` | `0` runs pixel shaders in Wave64 again (Wave32 by default) |
 
 PanVK and Panfrost:
 

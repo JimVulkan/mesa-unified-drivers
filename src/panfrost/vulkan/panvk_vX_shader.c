@@ -2621,6 +2621,15 @@ panvk_shader_get_executable_statistics(
       needs_vary ? &variant->info.stats_idvs_varying : &variant->info.stats;
 
    vk_add_pan_stats(out, stats);
+
+   /* The per-thread stack, which the stack allocation multiplies by every thread slot of every
+    * core ID: 768 x 23 on the Exynos 9820's G76. */
+   vk_outarray_append_typed(VkPipelineExecutableStatisticKHR, &out, stat) {
+      VK_COPY_STR(stat->name, "Thread-local storage");
+      VK_COPY_STR(stat->description, "Bytes of stack per thread: spills and scratch");
+      stat->format = VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR;
+      stat->value.u64 = variant->info.tls_size;
+   }
    return vk_outarray_status(&out);
 }
 

@@ -75,6 +75,8 @@ struct radv_image {
 
    unsigned plane_count;
    bool disjoint;
+   /* Xclipse (pdev->xclipse_bc5_alias): the emulated plane 1 lives in plane 0's memory. */
+   bool xclipse_bc_alias;
    struct radv_image_plane planes[0];
 };
 

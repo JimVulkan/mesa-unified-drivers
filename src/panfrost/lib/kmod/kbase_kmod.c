@@ -325,6 +325,12 @@ kbase_kmod_query_props(int fd, struct pan_kmod_dev_props *props)
    props->l2_features = P(RAW_L2_FEATURES, 0);
 
    props->texture_features[0] = P(TEXTURE_FEATURES_0, 0);
+   /* PROBE ONLY: OR extra compressed-format bits into what the GPU reports, to ask the texture
+    * unit directly whether it decodes a format its feature register leaves out
+    * (probe/mali/malibcn.c). */
+   const char *texfeat_or = getenv("PANVK_TEXFEAT0_OR");
+   if (texfeat_or)
+      props->texture_features[0] |= (uint32_t)strtoul(texfeat_or, NULL, 0);
    props->texture_features[1] = P(TEXTURE_FEATURES_1, 0);
    props->texture_features[2] = P(TEXTURE_FEATURES_2, 0);
    props->texture_features[3] = 0;

@@ -15,6 +15,7 @@
 #include "pan_props.h"
 
 #include "panvk_android.h"
+#include "panvk_bc_emu.h"
 #include "panvk_device.h"
 #include "panvk_device_memory.h"
 #include "panvk_entrypoints.h"
@@ -120,6 +121,11 @@ get_iusage(struct panvk_image *image, const VkImageCreateInfo *create_info)
 static unsigned
 get_plane_count(struct panvk_image *image)
 {
+   /* An emulated BC format carries its hidden hardware-format plane (panvk_bc_emu.h). */
+   if (panvk_bc_emu_format(to_panvk_physical_device(image->vk.base.device->physical),
+                           image->vk.format))
+      return 2;
+
    bool combined_ds = vk_format_aspects(image->vk.format) ==
                       (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
 
@@ -189,6 +195,9 @@ select_plane_pfmt(struct panvk_image *image, uint64_t mod, unsigned plane)
       /* X8_D24 can be lowered to D24 on Valhall if AFBC is enabled. */
       return select_depth_plane_pfmt(image, mod);
    }
+
+   if (plane == 1 && panvk_bc_emu_format(phys_dev, image->vk.format))
+      return vk_format_to_pipe_format(panvk_bc_emu_carrier(phys_dev, image->vk.format));
 
    VkFormat plane_format = vk_format_get_plane_format(image->vk.format, plane);
    return vk_format_to_pipe_format(plane_format);
@@ -755,6 +764,11 @@ panvk_CreateImage(VkDevice device, const VkImageCreateInfo *pCreateInfo,
       return result;
    }
 
+   /* The app's usage, not the one widened for vk_meta above. */
+   image->bc_emu.linear_sampled = pCreateInfo->tiling == VK_IMAGE_TILING_LINEAR &&
+                                  (pCreateInfo->usage & VK_IMAGE_USAGE_SAMPLED_BIT) &&
+                                  panvk_bc_emu_format(phys_dev, image->vk.format);
+
    uint64_t size = panvk_image_get_total_size(image);
 
    /*
@@ -842,6 +856,8 @@ panvk_DestroyImage(VkDevice _device, VkImage _image,
 
    if (!image)
       return;
+
+   panvk_bc_emu_untrack_image(device, image);
 
    if (image->vk.create_flags &
        VK_IMAGE_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT) {
@@ -1377,6 +1393,9 @@ panvk_image_bind(struct panvk_device *dev,
    if (!!(image->vk.create_flags &
           VK_IMAGE_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT))
       bind_ms_images(dev, bind_info);
+
+   if (image->bc_emu.linear_sampled)
+      panvk_bc_emu_track_linear(dev, image);
 
    return VK_SUCCESS;
 }

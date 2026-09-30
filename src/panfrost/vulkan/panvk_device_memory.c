@@ -258,6 +258,9 @@ panvk_FreeMemory(VkDevice _device, VkDeviceMemory _mem,
    if (mem == NULL)
       return;
 
+   /* No refresh of a linear BC image may reach this memory any more (panvk_bc_emu.h). */
+   panvk_bc_emu_untrack_memory(device, mem);
+
    struct panvk_physical_device *physical_device =
       to_panvk_physical_device(device->vk.physical);
 

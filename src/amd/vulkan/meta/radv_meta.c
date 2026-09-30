@@ -100,10 +100,12 @@ radv_resume_queries(const struct radv_meta_saved_state *state, struct radv_cmd_b
    }
 }
 
-void
-radv_meta_begin(struct radv_cmd_buffer *cmd_buffer)
+static void
+meta_begin(struct radv_cmd_buffer *cmd_buffer, uintptr_t caller)
 {
    struct radv_meta_saved_state *state = &cmd_buffer->state.meta;
+
+   cmd_buffer->xprof_op = caller;
 
    state->flags = 0;
 
@@ -118,6 +120,14 @@ radv_meta_begin(struct radv_cmd_buffer *cmd_buffer)
 
    assert(!state->inside_meta_op);
    state->inside_meta_op = true;
+}
+
+/* The field profiler names a meta op by the function that began it (__builtin_return_address,
+ * symbolized offline against the unstripped driver). */
+__attribute__((noinline)) void
+radv_meta_begin(struct radv_cmd_buffer *cmd_buffer)
+{
+   meta_begin(cmd_buffer, (uintptr_t)__builtin_return_address(0));
 }
 
 void
@@ -262,12 +272,12 @@ radv_meta_end(struct radv_cmd_buffer *cmd_buffer)
    radv_resume_queries(state, cmd_buffer);
 }
 
-void
+__attribute__((noinline)) void
 radv_meta_begin_rendering(struct radv_cmd_buffer *cmd_buffer)
 {
    assert(cmd_buffer->state.render.active);
 
-   radv_meta_begin(cmd_buffer);
+   meta_begin(cmd_buffer, (uintptr_t)__builtin_return_address(0));
 
    /* We always enable HiZ within meta operations, so this needs to be set for meta draws which
     * don't have their own render pass instance.

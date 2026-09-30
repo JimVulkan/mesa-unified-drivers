@@ -35,6 +35,8 @@ bool u_xclipse_prof_armed(void);
 /* True only while sampling; time a wait only then. */
 bool u_xclipse_prof_active(void);
 void u_xclipse_prof_wait(enum u_xclipse_wait kind, int64_t ns);
+/* Pipeline creation inside the window (the driver's CreateGraphics/ComputePipelines). */
+void u_xclipse_prof_pipeline(int64_t ns, unsigned count, bool library);
 /* The driver writes its GPU lines ("# gpu ...", "# pass ...") into the report, from the helper
  * thread after the window. */
 typedef void (*u_xclipse_prof_gpu_fn)(void *data, FILE *f);
@@ -46,6 +48,7 @@ static inline unsigned u_xclipse_prof_frames(void) { return 0; }
 static inline bool u_xclipse_prof_armed(void) { return false; }
 static inline bool u_xclipse_prof_active(void) { return false; }
 static inline void u_xclipse_prof_wait(enum u_xclipse_wait kind, int64_t ns) {}
+static inline void u_xclipse_prof_pipeline(int64_t ns, unsigned count, bool library) {}
 #endif
 
 #ifdef __cplusplus

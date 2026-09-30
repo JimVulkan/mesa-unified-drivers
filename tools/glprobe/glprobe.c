@@ -28,6 +28,9 @@
  *  13  etc2             2x2 blocks of ETC2 RGB8 (individual mode, known colours)
  *  14  astc3d           sliced 3D ASTC 4x4: two slices of 2x2 blocks, the second one sampled
  *  15  discard          discarded fragments must not write depth (cutout grass in front of water)
+ *  16  rtt              render to a 1280x720 texture (big enough for DCC), then sample it: RGBA8,
+ *                       RGBA16F, R11G11B10F, RGB10A2; a fast clear and a tiled draw; then an
+ *                       RGBA8 glTexSubImage2D upload and a glGenerateMipmap'd level 2
  *
  * Driver selection comes from the environment (MESA_LOADER_DRIVER_OVERRIDE=radeonsi).
  */
@@ -131,7 +134,11 @@ static PFNEGLGETPLATFORMDISPLAYEXTPROC p_eglGetPlatformDisplayEXT;
    X(PFNGLGETQUERYOBJECTUIVPROC, glGetQueryObjectuiv)                                              \
    X(PFNGLDELETEQUERIESPROC, glDeleteQueries)                                                      \
    X(PFNGLDELETETEXTURESPROC, glDeleteTextures)                                                    \
-   X(PFNGLDELETEVERTEXARRAYSPROC, glDeleteVertexArrays)
+   X(PFNGLDELETEVERTEXARRAYSPROC, glDeleteVertexArrays)                                            \
+   X(PFNGLTEXSTORAGE2DPROC, glTexStorage2D)                                                        \
+   X(PFNGLFRAMEBUFFERTEXTURE2DPROC, glFramebufferTexture2D)                                        \
+   X(PFNGLTEXSUBIMAGE2DPROC, glTexSubImage2D)                                                      \
+   X(PFNGLGENERATEMIPMAPPROC, glGenerateMipmap)
 
 #define DECL(type, name) static type name;
 GL_FUNCS(DECL)
@@ -1010,6 +1017,179 @@ static int t_astc3d(void)
    return r;
 }
 
+/* Render to a 1280x720 texture, then sample it: the path a deferred shader pack takes every frame
+ * (G-buffer written by the CB, read by the texture unit). Only a surface this size gets DCC on the
+ * 920 (64x64 targets are 4 KB-swizzled, no DCC), so this is the test that can see a sampled-DCC
+ * decode mismatch. Per format: a fast clear sampled back, then a draw of 16x16 constant tiles
+ * (what DCC compresses best) plus a fine gradient (what it can't), sampled with texelFetch. */
+#define RTW 1280
+#define RTH 720
+static float rtt_tile(int x, int y, int c)
+{
+   const int tx = x / 16, ty = y / 16;
+   return c == 0 ? (tx % 16) / 15.0f : c == 1 ? (ty % 16) / 15.0f : c == 2 ? ((x & 1) ? 0.75f : 0.25f) : 1.0f;
+}
+
+static int t_rtt(void)
+{
+   static const struct { GLenum fmt; const char *name; int tol; } F[] = {
+      {GL_RGBA8, "RGBA8", 1}, {GL_RGBA16F, "RGBA16F", 1}, {GL_R11F_G11F_B10F, "R11G11B10F", 4},
+      {GL_RGB10_A2, "RGB10A2", 1},
+   };
+   int bad = 0;
+   GLuint pd = program(VS_POS2,
+                       "#version 330 core\nout vec4 c;\n"
+                       "void main() { ivec2 p = ivec2(gl_FragCoord.xy); ivec2 t = p / 16;\n"
+                       "  c = vec4(float(t.x % 16) / 15.0, float(t.y % 16) / 15.0,\n"
+                       "           (p.x & 1) != 0 ? 0.75 : 0.25, 1.0); }\n",
+                       NULL);
+   GLuint ps = program(VS_POS2,
+                       "#version 330 core\nuniform sampler2D s;\nout vec4 c;\n"
+                       "void main() { ivec2 p = ivec2(gl_FragCoord.xy);\n"
+                       "  c = texelFetch(s, ivec2(p.x * 20 + 3, p.y * 11 + 5), 0); }\n",
+                       NULL);
+   if (!pd || !ps)
+      return 1;
+   set_verts(FULLSCREEN, 6);
+   glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, 0);
+   glEnableVertexAttribArray(0);
+   for (unsigned i = 0; i < sizeof(F) / sizeof(F[0]); i++) {
+      GLuint t, fb;
+      glGenTextures(1, &t);
+      glActiveTexture(GL_TEXTURE0);
+      glBindTexture(GL_TEXTURE_2D, t);
+      glTexStorage2D(GL_TEXTURE_2D, 1, F[i].fmt, RTW, RTH);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+      glGenFramebuffers(1, &fb);
+      glBindFramebuffer(GL_FRAMEBUFFER, fb);
+      glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t, 0);
+      if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+         printf("   %s: FBO incomplete\n", F[i].name);
+         bad++;
+         continue;
+      }
+      for (int pass = 0; pass < 2; pass++) {
+         /* write the 1280x720 target */
+         glBindFramebuffer(GL_FRAMEBUFFER, fb);
+         glViewport(0, 0, RTW, RTH);
+         glClearColor(0.25f, 0.5f, 0.75f, 1.0f);
+         glClear(GL_COLOR_BUFFER_BIT);
+         if (pass == 1) {
+            glUseProgram(pd);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+         }
+         /* sample it into the 64x64 target */
+         struct fbo f;
+         if (!fbo_create(&f, GL_RGBA8, 0, 1))
+            return 1;
+         glUseProgram(ps);
+         glUniform1i(glGetUniformLocation(ps, "s"), 0);
+         glDrawArrays(GL_TRIANGLES, 0, 3);
+         readback();
+         int wrong = 0, fx = -1, fy = -1;
+         for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++) {
+               const int sx = x * 20 + 3, sy = y * 11 + 5;
+               for (int c = 0; c < 4; c++) {
+                  const float v = pass ? rtt_tile(sx, sy, c) : (c == 0 ? 0.25f : c == 1 ? 0.5f : c == 2 ? 0.75f : 1.0f);
+                  const int e = (int)lrintf(v * 255.0f);
+                  if (abs((int)at(x, y)[c] - e) > F[i].tol) {
+                     if (!wrong) { fx = x; fy = y; }
+                     wrong++;
+                     break;
+                  }
+               }
+            }
+         const char *what = pass ? "draw" : "clear";
+         if (wrong)
+            printf("   %s %s: %d/%d samples wrong; first (%d,%d) got %u,%u,%u,%u\n", F[i].name, what, wrong,
+                   W * H, fx, fy, at(fx, fy)[0], at(fx, fy)[1], at(fx, fy)[2], at(fx, fy)[3]);
+         else
+            printf("   %s %s: all %d samples right\n", F[i].name, what, W * H);
+         bad += wrong + gl_err(what);
+         fbo_destroy(&f);
+      }
+      glDeleteFramebuffers(1, &fb);
+      glDeleteTextures(1, &t);
+   }
+
+   /* RGBA8 texture of the same size filled by glTexSubImage2D (the driver's upload path, a copy
+    * into a DCC surface), then a mipmapped one drawn at level 0 and glGenerateMipmap'd, level 2
+    * sampled: the tiles average to themselves, the 1-pixel B stripes to 0.5. */
+   {
+      static uint8_t up[RTW * RTH * 4];
+      for (int y = 0; y < RTH; y++)
+         for (int x = 0; x < RTW; x++)
+            for (int c = 0; c < 4; c++)
+               up[(y * RTW + x) * 4 + c] = (uint8_t)lrintf(rtt_tile(x, y, c) * 255.0f);
+      for (int mode = 0; mode < 2; mode++) {
+         GLuint t, fb = 0;
+         glGenTextures(1, &t);
+         glActiveTexture(GL_TEXTURE0);
+         glBindTexture(GL_TEXTURE_2D, t);
+         glTexStorage2D(GL_TEXTURE_2D, mode ? 3 : 1, GL_RGBA8, RTW, RTH);
+         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+         if (!mode) {
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, RTW, RTH, GL_RGBA, GL_UNSIGNED_BYTE, up);
+         } else {
+            glGenFramebuffers(1, &fb);
+            glBindFramebuffer(GL_FRAMEBUFFER, fb);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t, 0);
+            glViewport(0, 0, RTW, RTH);
+            glUseProgram(pd);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            glGenerateMipmap(GL_TEXTURE_2D);
+         }
+         const int lod = mode ? 2 : 0;
+         char fs[512];
+         snprintf(fs, sizeof(fs),
+                  "#version 330 core\nuniform sampler2D s;\nout vec4 c;\n"
+                  "void main() { ivec2 p = ivec2(gl_FragCoord.xy);\n"
+                  "  c = texelFetch(s, ivec2(p.x * %d + 1, p.y * %d + 1), %d); }\n",
+                  mode ? 5 : 20, mode ? 2 : 11, lod);
+         GLuint pl = program(VS_POS2, fs, NULL);
+         struct fbo f;
+         if (!pl || !fbo_create(&f, GL_RGBA8, 0, 1))
+            return 1;
+         glUseProgram(pl);
+         glUniform1i(glGetUniformLocation(pl, "s"), 0);
+         glDrawArrays(GL_TRIANGLES, 0, 3);
+         readback();
+         int wrong = 0, fx = -1, fy = -1;
+         for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++) {
+               const int sx = x * (mode ? 5 : 20) + 1, sy = y * (mode ? 2 : 11) + 1;
+               for (int c = 0; c < 4; c++) {
+                  const float v = mode ? (c == 2 ? 0.5f : rtt_tile(sx * 4, sy * 4, c)) : rtt_tile(sx, sy, c);
+                  if (abs((int)at(x, y)[c] - (int)lrintf(v * 255.0f)) > 1) {
+                     if (!wrong) { fx = x; fy = y; }
+                     wrong++;
+                     break;
+                  }
+               }
+            }
+         const char *what = mode ? "RGBA8 mip 2 after glGenerateMipmap" : "RGBA8 glTexSubImage2D";
+         if (wrong)
+            printf("   %s: %d/%d samples wrong; first (%d,%d) got %u,%u,%u,%u\n", what, wrong, W * H, fx,
+                   fy, at(fx, fy)[0], at(fx, fy)[1], at(fx, fy)[2], at(fx, fy)[3]);
+         else
+            printf("   %s: all %d samples right\n", what, W * H);
+         bad += wrong + gl_err(what);
+         fbo_destroy(&f);
+         glDeleteProgram(pl);
+         if (fb)
+            glDeleteFramebuffers(1, &fb);
+         glDeleteTextures(1, &t);
+      }
+   }
+   glDeleteProgram(pd);
+   glDeleteProgram(ps);
+   return bad;
+}
+
 /* ---- main --------------------------------------------------------------------------------- */
 static int want[32];
 
@@ -1108,7 +1288,7 @@ int main(int argc, char **argv)
       {"depth", t_depth},    {"ubo", t_ubo},         {"compute", t_compute},
       {"occlusion", t_occlusion}, {"msaa", t_msaa},  {"terrain", t_terrain},
       {"astc", t_astc},      {"etc2", t_etc2},      {"astc3d", t_astc3d},
-      {"discard", t_discard},
+      {"discard", t_discard}, {"rtt", t_rtt},
    };
    int fails = 0, ran = 0;
    for (unsigned i = 1; i < sizeof(tests) / sizeof(tests[0]); i++) {

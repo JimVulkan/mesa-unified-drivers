@@ -32,6 +32,7 @@
 #include "drm-uapi/panfrost_drm.h"
 
 #include "kmod/kbase_kmod.h"
+#include "panvk_bc_emu.h"
 #include "util/u_sync_provider.h"
 
 static void panvk_signal_event_syncobjs(struct panvk_gpu_queue *queue,
@@ -139,13 +140,19 @@ static void
 panvk_queue_submit_kbase_chain(struct panvk_gpu_queue *queue, struct vk_queue_submit *submit)
 {
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
-   const uint32_t nr_cmdbufs = submit->command_buffer_count;
+   /* Linear images of emulated BC formats first, from what the host may have written into them
+    * since (panvk_bc_emu.h). Held until the submission has its sequence number. */
+   struct panvk_cmd_buffer *refresh =
+      submit->command_buffer_count ? panvk_per_arch(bc_emu_refresh_begin)(dev) : NULL;
+   const uint32_t nr_cmdbufs = submit->command_buffer_count + (refresh ? 1 : 0);
    const uint32_t nr_signals = submit->signal_count;
 
    struct panvk_kbase_done *d =
       malloc(sizeof(*d) + nr_cmdbufs * sizeof(struct panvk_cmd_buffer *) +
              nr_signals * sizeof(uint32_t));
    if (!d) {
+      if (refresh)
+         panvk_per_arch(bc_emu_refresh_end)(dev, refresh, 0);
       vk_device_set_lost(&dev->vk, "out of memory submitting");
       return;
    }
@@ -163,8 +170,9 @@ panvk_queue_submit_kbase_chain(struct panvk_gpu_queue *queue, struct vk_queue_su
    }
 
    for (uint32_t j = 0; j < nr_cmdbufs; ++j) {
-      d->cmdbufs[j] =
-         container_of(submit->command_buffers[j], struct panvk_cmd_buffer, vk);
+      d->cmdbufs[j] = refresh && j == 0 ? refresh
+                      : container_of(submit->command_buffers[j - (refresh ? 1 : 0)],
+                                     struct panvk_cmd_buffer, vk);
       /* Its batches are reset below if they ran before, which must not happen under a GPU still
        * running the previous submission of it (simultaneous use). */
       if (d->cmdbufs[j]->kbase_seq)
@@ -219,6 +227,8 @@ panvk_queue_submit_kbase_chain(struct panvk_gpu_queue *queue, struct vk_queue_su
    int fence = -1;
    const uint64_t seq = pan_kmod_kbase_submit_async(
       dev->kmod.dev, atoms, nr_atoms, nr_signals ? &fence : NULL, panvk_kbase_submit_done, d);
+   if (refresh)
+      panvk_per_arch(bc_emu_refresh_end)(dev, refresh, seq);
    if (!seq) {
       /* Signal anyway, so nothing waits forever on work that was never sent. */
       panvk_kbase_submit_done(d, false);
@@ -229,7 +239,7 @@ panvk_queue_submit_kbase_chain(struct panvk_gpu_queue *queue, struct vk_queue_su
    if (fence >= 0)
       close(fence);
 
-   for (uint32_t j = 0; j < nr_cmdbufs; ++j)
+   for (uint32_t j = 0; j < submit->command_buffer_count; ++j)
       container_of(submit->command_buffers[j], struct panvk_cmd_buffer, vk)->kbase_seq = seq;
 
 }

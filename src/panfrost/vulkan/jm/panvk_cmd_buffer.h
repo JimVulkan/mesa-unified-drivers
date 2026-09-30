@@ -96,6 +96,13 @@ struct panvk_cmd_buffer {
    struct list_head push_sets;
    struct panvk_batch *cur_batch;
 
+   /* kbase: the stack every batch of this command buffer shares, the largest one asked for so
+    * far. kbase runs a device's atoms one after another, so no two batches use it at once. */
+   struct {
+      uint64_t ptr;
+      unsigned size;
+   } tls_stack;
+
    struct {
       struct panvk_cmd_graphics_state gfx;
       struct panvk_cmd_compute_state compute;

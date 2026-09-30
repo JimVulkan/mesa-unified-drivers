@@ -8,10 +8,15 @@
 #include "radv_entrypoints.h"
 #include "radv_formats.h"
 #include "radv_meta.h"
+#include "radv_xclipse_prof.h"
 #include "radv_tracepoints.h"
 
 #include "util/format_rgb9e5.h"
 #include "vk_format.h"
+#include "util/detect_os.h"
+#if DETECT_OS_ANDROID
+#include <sys/system_properties.h>
+#endif
 #include "vk_shader_module.h"
 
 #include "ac_formats.h"
@@ -690,33 +695,33 @@ radv_can_fast_clear_depth(struct radv_cmd_buffer *cmd_buffer, const struct radv_
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
 
    if (!iview || !iview->support_fast_clear)
-      return false;
+      return radv_xprof_clear(cmd_buffer, iview, true, RADV_XCLR_NO_SUPPORT, &clear_value, sizeof(clear_value));
 
    if (!radv_layout_is_htile_compressed(device, iview->image, iview->vk.base_mip_level, image_layout,
                                         radv_image_queue_family_mask(iview->image, cmd_buffer->qf, cmd_buffer->qf)))
-      return false;
+      return radv_xprof_clear(cmd_buffer, iview, true, RADV_XCLR_LAYOUT, &clear_value, sizeof(clear_value));
 
    if (!radv_is_clear_rect_full(iview, clear_rect, view_mask))
-      return false;
+      return radv_xprof_clear(cmd_buffer, iview, true, RADV_XCLR_RECT, &clear_value, sizeof(clear_value));
 
    if (device->vk.enabled_extensions.EXT_depth_range_unrestricted && (aspects & VK_IMAGE_ASPECT_DEPTH_BIT) &&
        (clear_value.depth < 0.0 || clear_value.depth > 1.0))
-      return false;
+      return radv_xprof_clear(cmd_buffer, iview, true, RADV_XCLR_RANGE, &clear_value, sizeof(clear_value));
 
    if (radv_tc_compat_htile_enabled(iview->image, iview->vk.base_mip_level) &&
        (((aspects & VK_IMAGE_ASPECT_DEPTH_BIT) && !radv_is_fast_clear_depth_allowed(clear_value)) ||
         ((aspects & VK_IMAGE_ASPECT_STENCIL_BIT) && !radv_is_fast_clear_stencil_allowed(clear_value))))
-      return false;
+      return radv_xprof_clear(cmd_buffer, iview, true, RADV_XCLR_TC_VALUE, &clear_value, sizeof(clear_value));
 
    if (iview->image->vk.mip_levels > 1) {
       uint32_t last_level = iview->vk.base_mip_level + iview->vk.level_count - 1;
       if (last_level >= iview->image->planes[0].surface.num_meta_levels) {
          /* Do not fast clears if one level can't be fast cleared. */
-         return false;
+         return radv_xprof_clear(cmd_buffer, iview, true, RADV_XCLR_MIPS, &clear_value, sizeof(clear_value));
       }
    }
 
-   return true;
+   return radv_xprof_clear(cmd_buffer, iview, true, RADV_XCLR_FAST, &clear_value, sizeof(clear_value));
 }
 
 static void
@@ -1324,24 +1329,24 @@ radv_can_fast_clear_color(struct radv_cmd_buffer *cmd_buffer, const struct radv_
    uint32_t clear_color[2];
 
    if (!iview || !iview->support_fast_clear)
-      return false;
+      return radv_xprof_clear(cmd_buffer, iview, false, RADV_XCLR_NO_SUPPORT, &clear_value, sizeof(clear_value));
 
    if (!radv_layout_can_fast_clear(device, iview->image, iview->vk.base_mip_level, image_layout,
                                    radv_image_queue_family_mask(iview->image, cmd_buffer->qf, cmd_buffer->qf)))
-      return false;
+      return radv_xprof_clear(cmd_buffer, iview, false, RADV_XCLR_LAYOUT, &clear_value, sizeof(clear_value));
 
    if (!radv_is_clear_rect_full(iview, clear_rect, view_mask))
-      return false;
+      return radv_xprof_clear(cmd_buffer, iview, false, RADV_XCLR_RECT, &clear_value, sizeof(clear_value));
 
    /* DCC */
 
    /* Images that support comp-to-single clears don't have clear values. */
    if (!iview->image->support_comp_to_single) {
       if (!radv_format_pack_clear_color(iview->vk.format, clear_color, &clear_value))
-         return false;
+         return radv_xprof_clear(cmd_buffer, iview, false, RADV_XCLR_VALUE, &clear_value, sizeof(clear_value));
 
       if (!radv_image_has_clear_value(iview->image) && (clear_color[0] != 0 || clear_color[1] != 0))
-         return false;
+         return radv_xprof_clear(cmd_buffer, iview, false, RADV_XCLR_VALUE, &clear_value, sizeof(clear_value));
    }
 
    if (radv_dcc_enabled(iview->image, iview->vk.base_mip_level)) {
@@ -1350,7 +1355,7 @@ radv_can_fast_clear_color(struct radv_cmd_buffer *cmd_buffer, const struct radv_
 
       if (pdev->info.gfx_level >= GFX11) {
          if (!gfx11_get_fast_clear_parameters(device, iview, &clear_value, &reset_value))
-            return false;
+            return radv_xprof_clear(cmd_buffer, iview, false, RADV_XCLR_DCC_PARAMS, &clear_value, sizeof(clear_value));
       } else {
          gfx8_get_fast_clear_parameters(device, iview, &clear_value, &reset_value, &can_avoid_fast_clear_elim);
       }
@@ -1360,7 +1365,7 @@ radv_can_fast_clear_color(struct radv_cmd_buffer *cmd_buffer, const struct radv_
             uint32_t last_level = iview->vk.base_mip_level + iview->vk.level_count - 1;
             if (last_level >= iview->image->planes[0].surface.num_meta_levels) {
                /* Do not fast clears if one level can't be fast cleard. */
-               return false;
+               return radv_xprof_clear(cmd_buffer, iview, false, RADV_XCLR_MIPS, &clear_value, sizeof(clear_value));
             }
          } else {
             for (uint32_t l = 0; l < iview->vk.level_count; l++) {
@@ -1372,13 +1377,13 @@ radv_can_fast_clear_color(struct radv_cmd_buffer *cmd_buffer, const struct radv_
                 * fast cleared.
                 */
                if (!dcc_level->dcc_fast_clear_size)
-                  return false;
+                  return radv_xprof_clear(cmd_buffer, iview, false, RADV_XCLR_MIPS, &clear_value, sizeof(clear_value));
             }
          }
       }
    }
 
-   return true;
+   return radv_xprof_clear(cmd_buffer, iview, false, RADV_XCLR_FAST, &clear_value, sizeof(clear_value));
 }
 
 static void
@@ -1465,6 +1470,97 @@ radv_fast_clear_color(struct radv_cmd_buffer *cmd_buffer, const struct radv_imag
    radv_update_color_clear_metadata(cmd_buffer, iview, clear_att->colorAttachment, clear_color);
 }
 
+/*
+ * Xclipse: a whole-image clear of a colour image with no compression metadata (no DCC, CMASK or
+ * FMASK), one level, one layer, one sample, as a memory fill instead of a full-screen draw. With
+ * no metadata every texel is the packed clear value, whatever the swizzle mode, so the surface is
+ * a repeated 32-bit pattern (64-bit values only when both halves are equal). Live switch:
+ * debug.radv_xclipse_fillclear 1, read per clear, so a profiler window can A/B it in one session.
+ */
+static bool
+radv_xclipse_fill_clear_on(void)
+{
+#if DETECT_OS_ANDROID
+   char v[PROP_VALUE_MAX] = {0};
+   return __system_property_get("debug.radv_xclipse_fillclear", v) > 0 && v[0] == '1';
+#else
+   return false;
+#endif
+}
+
+static bool
+radv_try_fill_clear_color(struct radv_cmd_buffer *cmd_buffer, const struct radv_image_view *iview,
+                          const VkClearAttachment *clear_att, const VkClearRect *clear_rect,
+                          enum radv_cmd_flush_bits *pre_flush, enum radv_cmd_flush_bits *post_flush,
+                          uint32_t view_mask)
+{
+   struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+   const struct radv_physical_device *pdev = radv_device_physical(device);
+
+   if (!pdev->info.gfx11_shader_core || !iview || view_mask)
+      return false;
+   const struct radv_image *image = iview->image;
+   if (image->vk.samples != 1 || image->vk.mip_levels != 1 || image->vk.array_layers != 1 ||
+       image->plane_count != 1 || image->disjoint)
+      return false;
+   if (radv_image_has_dcc(image) || radv_image_has_cmask(image) || radv_image_has_fmask(image))
+      return false;
+   if (!radv_is_clear_rect_full(iview, clear_rect, view_mask))
+      return false;
+   if (vk_format_get_blocksizebits(iview->vk.format) != vk_format_get_blocksizebits(image->vk.format))
+      return false;
+
+   VkClearColorValue value = clear_att->clearValue.color;
+   uint32_t c[2] = {0, 0};
+   if (!radv_format_pack_clear_color(iview->vk.format, c, &value))
+      return false;
+   uint32_t pattern;
+   switch (vk_format_get_blocksizebits(iview->vk.format)) {
+   case 8:
+      pattern = (c[0] & 0xff) * 0x01010101u;
+      break;
+   case 16:
+      pattern = (c[0] & 0xffff) | (c[0] << 16);
+      break;
+   case 32:
+      pattern = c[0];
+      break;
+   case 64:
+      if (c[0] != c[1])
+         return false;
+      pattern = c[0];
+      break;
+   default:
+      return false;
+   }
+   if (!radv_xclipse_fill_clear_on())
+      return false;
+
+   /* Everything that rendered to or read the image is done and out of the CB caches before the
+    * fill writes it; the fill's own flush bits order it before the draws that follow. */
+   enum radv_cmd_flush_bits bits =
+      RADV_CMD_FLAG_PS_PARTIAL_FLUSH |
+      radv_src_access_flush(cmd_buffer, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, 0, image, NULL);
+   if (pre_flush) {
+      cmd_buffer->state.flush_bits |= bits & ~*pre_flush;
+      *pre_flush |= cmd_buffer->state.flush_bits;
+   } else {
+      cmd_buffer->state.flush_bits |= bits;
+   }
+
+   const uint64_t size = image->planes[0].surface.surf_size & ~3ull;
+   uint32_t flush = radv_fill_image(cmd_buffer, image, 0, size, pattern);
+   if (post_flush)
+      *post_flush |= flush;
+   else
+      cmd_buffer->state.flush_bits |= flush;
+
+   if (radv_xprof_sampling())
+      radv_xprof_clear_slow(cmd_buffer, iview, false, RADV_XCLR_FILL, &value, sizeof(value));
+   return true;
+}
+
 /**
  * The parameters mean that same as those in vkCmdClearAttachments.
  */
@@ -1487,7 +1583,8 @@ emit_clear(struct radv_cmd_buffer *cmd_buffer, const VkClearAttachment *clear_at
       if (radv_can_fast_clear_color(cmd_buffer, color_att->iview, color_att->layout, clear_rect, clear_value,
                                     view_mask)) {
          radv_fast_clear_color(cmd_buffer, color_att->iview, clear_att, clear_rect, pre_flush, post_flush, view_mask);
-      } else {
+      } else if (!radv_try_fill_clear_color(cmd_buffer, color_att->iview, clear_att, clear_rect, pre_flush,
+                                            post_flush, view_mask)) {
          emit_color_clear(cmd_buffer, clear_att, clear_rect, view_mask);
       }
    } else {

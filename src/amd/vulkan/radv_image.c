@@ -9,6 +9,10 @@
  */
 
 #include "radv_image.h"
+#include "ac_xclipse_log.h"
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
 #include "tools/radv_debug.h"
 #include "tools/radv_rmv.h"
 #include "util/u_atomic.h"
@@ -139,11 +143,14 @@ radv_image_use_fast_clear_for_image_early(const struct radv_device *device, cons
    if (instance->debug_flags & RADV_DEBUG_FORCE_COMPRESS)
       return true;
 
-   if (image->vk.samples <= 1 && image->vk.extent.width * image->vk.extent.height <= 512 * 512) {
+   if (image->vk.samples <= 1 && image->vk.extent.width * image->vk.extent.height <= 512 * 512 &&
+       !pdev->xclipse_dcc_small) {
       /* Do not enable CMASK or DCC for small surfaces where the cost
        * of the eliminate pass can be higher than the benefit of fast
        * clear. RadeonSI does this, but the image threshold is
        * different.
+       * Xclipse (xclipse_dcc_small): MGSV clears ~12 such targets a frame by drawing them, and
+       * every clear it issues is to 0/1 values, which GFX10.3 DCC clears without an eliminate.
        */
       return false;
    }
@@ -237,6 +244,49 @@ radv_formats_is_atomic_allowed(struct radv_device *device, const void *pNext, Vk
    return false;
 }
 
+/* Why DCC was not used for the image being created (logged with debug.radv_xclipse_log >= 1, see
+ * radv_image_create_layout): the field profiler shows which render targets clear by drawing, this
+ * says why they have no DCC. */
+static __thread const char *radv_dcc_why;
+
+static bool
+dcc_no(const char *why)
+{
+   radv_dcc_why = why;
+   return false;
+}
+
+/* One line per colour render target at creation, with debug.radv_xclipse_log >= 1: whether it got
+ * DCC, and if not the first check that refused it. */
+static void
+radv_log_dcc_decision(struct radv_device *device, const struct radv_image *image,
+                      const VkImageCreateInfo *pCreateInfo, VkFormat format, const char *stage, const char *why)
+{
+#ifdef __ANDROID__
+   if (ac_xclipse_log_level() < 1 || !pCreateInfo ||
+       !(image->vk.usage & (VK_IMAGE_USAGE_2_COLOR_ATTACHMENT_BIT_KHR |
+                            VK_IMAGE_USAGE_2_DEPTH_STENCIL_ATTACHMENT_BIT_KHR | VK_IMAGE_USAGE_2_STORAGE_BIT_KHR)))
+      return;
+   const VkImageFormatListCreateInfo *list =
+      vk_find_struct_const(pCreateInfo->pNext, IMAGE_FORMAT_LIST_CREATE_INFO);
+   char fl[160] = "";
+   if (list) {
+      for (uint32_t i = 0; i < list->viewFormatCount && strlen(fl) < sizeof(fl) - 8; i++)
+         snprintf(fl + strlen(fl), sizeof(fl) - strlen(fl), "%s%u", i ? "," : "", list->pViewFormats[i]);
+   }
+   __android_log_print(ANDROID_LOG_INFO, "RADV_DCC",
+                       "[DCC] %s %s dcc %d htile %d tc_htile %d cmask %d fmask %d size %llu fmt %u %ux%u mips %u "
+                       "layers %u samples %u usage 0x%llx flags 0x%llx sharing %s qfm 0x%x ext 0x%x list [%s]",
+                       why ? "NO" : "yes", why ? why : stage, radv_image_has_dcc(image), radv_image_has_htile(image),
+                       radv_image_is_tc_compat_htile(image), radv_image_has_cmask(image), radv_image_has_fmask(image),
+                       (unsigned long long)image->size, format, image->vk.extent.width,
+                       image->vk.extent.height, image->vk.mip_levels, image->vk.array_layers,
+                       image->vk.samples, (unsigned long long)image->vk.usage,
+                       (unsigned long long)image->vk.create_flags, image->exclusive ? "excl" : "CONCURRENT",
+                       image->queue_family_mask, image->vk.external_handle_types, fl);
+#endif
+}
+
 static bool
 radv_use_dcc_for_image_early(struct radv_device *device, struct radv_image *image, const VkImageCreateInfo *pCreateInfo,
                              VkFormat format, bool *sign_reinterpret)
@@ -246,14 +296,14 @@ radv_use_dcc_for_image_early(struct radv_device *device, struct radv_image *imag
 
    /* DCC (Delta Color Compression) is only available for GFX8+. */
    if (pdev->info.gfx_level < GFX8)
-      return false;
+      return dcc_no("gfx_level");
 
    if (radv_is_dcc_disabled(pdev) || image->vk.compr_flags == VK_IMAGE_COMPRESSION_DISABLED_EXT) {
-      return false;
+      return dcc_no("disabled");
    }
 
    if (image->vk.external_handle_types && image->vk.tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT)
-      return false;
+      return dcc_no("external");
 
    /*
     * TODO: Enable DCC for storage images on GFX9 and earlier.
@@ -265,64 +315,66 @@ radv_use_dcc_for_image_early(struct radv_device *device, struct radv_image *imag
    if ((image->vk.usage & VK_IMAGE_USAGE_2_STORAGE_BIT_KHR) &&
        (pdev->info.gfx_level < GFX10 ||
         radv_formats_is_atomic_allowed(device, pCreateInfo->pNext, format, image->vk.create_flags)))
-      return false;
+      return dcc_no("storage_atomics");
 
    if (image->vk.tiling == VK_IMAGE_TILING_LINEAR)
-      return false;
+      return dcc_no("linear");
 
    if (vk_format_is_subsampled(format) || (pdev->info.gfx_level < GFX12 && vk_format_get_plane_count(format) > 1))
-      return false;
+      return dcc_no("subsampled_or_planar");
 
    if (!radv_image_use_fast_clear_for_image_early(device, image) &&
        image->vk.tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT)
-      return false;
+      return dcc_no("fast_clear_early(small_or_no_color_attachment)");
 
    /* Do not enable DCC for mipmapped arrays because performance is worse. */
    if (image->vk.array_layers > 1 && image->vk.mip_levels > 1)
-      return false;
+      return dcc_no("mip_array");
 
    if (pdev->info.gfx_level < GFX10) {
       /* TODO: Add support for DCC MSAA on GFX8-9. */
       if (image->vk.samples > 1 && !pdev->dcc_msaa_allowed)
-         return false;
+         return dcc_no("msaa_gfx8_9");
 
       /* TODO: Add support for DCC layers/mipmaps on GFX9. */
       if ((image->vk.array_layers > 1 || image->vk.mip_levels > 1) && pdev->info.gfx_level == GFX9)
-         return false;
+         return dcc_no("layers_mips_gfx9");
    }
 
    /* Force disable DCC for mips to workaround game bugs. */
    if (radv_are_dcc_mips_disabled(pdev) && image->vk.mip_levels > 1)
-      return false;
+      return dcc_no("dcc_mips_disabled");
 
    /* Force disable DCC for stores to workaround game bugs. */
    if (radv_are_dcc_stores_disabled(pdev) && (image->vk.usage & VK_IMAGE_USAGE_2_STORAGE_BIT_KHR))
-      return false;
+      return dcc_no("dcc_stores_disabled");
 
    /* DCC MSAA can't work on GFX10.3 and earlier without FMASK. (Xclipse 920 disables FMASK, and its
     * CB hangs on GFX10.3-style MSAA DCC anyway.) */
    if (image->vk.samples > 1 && pdev->info.gfx_level < GFX11 && !pdev->use_fmask)
-      return false;
+      return dcc_no("msaa_no_fmask");
 
-   return radv_are_formats_dcc_compatible(pdev, pCreateInfo->pNext, format, image->vk.create_flags, sign_reinterpret);
+   if (!radv_are_formats_dcc_compatible(pdev, pCreateInfo->pNext, format, image->vk.create_flags, sign_reinterpret))
+      return dcc_no("formats_incompatible(mutable_format_list)");
+   return true;
 }
 
 static bool
 radv_use_dcc_for_image_late(struct radv_device *device, struct radv_image *image)
 {
    if (!radv_image_has_dcc(image))
-      return false;
+      return dcc_no("late:no_dcc");
 
    if (image->vk.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT)
       return true;
 
    if (!radv_image_use_fast_clear_for_image(device, image))
-      return false;
+      return dcc_no("late:fast_clear(not_exclusive_or_small)");
 
    /* TODO: Fix storage images with DCC without DCC image stores.
     * Disabling it for now. */
    if ((image->vk.usage & VK_IMAGE_USAGE_2_STORAGE_BIT_KHR) && !radv_image_compress_dcc_on_image_stores(device, image))
-      return false;
+      return dcc_no("late:storage_without_dcc_stores");
 
    return true;
 }
@@ -685,8 +737,11 @@ radv_get_surface_flags(struct radv_device *device, struct radv_image *image, uns
        vk_format_get_blocksizebits(image_format) == 128 && vk_format_is_compressed(image_format))
       flags |= RADEON_SURF_NO_RENDER_TARGET;
 
+   radv_dcc_why = NULL;
    if (!radv_use_dcc_for_image_early(device, image, pCreateInfo, image_format, &image->dcc_sign_reinterpret))
       flags |= RADEON_SURF_DISABLE_DCC;
+   else if ((image->queue_family_mask & BITFIELD_BIT(RADV_QUEUE_TRANSFER)) && !pdev->info.sdma_supports_compression)
+      radv_dcc_why = "transfer_queue_without_sdma_compression";
 
    if (!radv_use_fmask_for_image(device, image))
       flags |= RADEON_SURF_NO_FMASK;
@@ -1202,6 +1257,35 @@ radv_image_init_first_mip_pipe_misaligned(const struct radv_device *device, stru
    }
 }
 
+/* Xclipse (on by default): BC5_UNORM's EAC_R11G11 plane can share plane 0's memory. Both are 16-byte 4x4
+ * blocks, and every write into the image then transcodes either straight from the copy's source
+ * buffer (radv_CmdCopyBufferToImage2) or in place (a copy into plane 0, then radv_meta_decode_bc
+ * reading and writing each block where it is). Only when the two surfaces are laid out
+ * identically. */
+static bool
+radv_xclipse_bc_can_alias(const struct radv_physical_device *pdev, const struct radv_image *image,
+                          const struct radv_image_create_info *create_info)
+{
+   if (!pdev->xclipse_bc5_alias || image->vk.format != VK_FORMAT_BC5_UNORM_BLOCK ||
+       !radv_is_format_emulated(pdev, image->vk.format) || image->disjoint || create_info->bo_metadata ||
+       (image->vk.create_flags & VK_IMAGE_CREATE_2_SPARSE_BINDING_BIT_KHR))
+      return false;
+
+   const struct radeon_surf *a = &image->planes[0].surface, *b = &image->planes[1].surface;
+   const bool same = a->bpe == b->bpe && a->blk_w == b->blk_w && a->blk_h == b->blk_h && a->is_linear == b->is_linear &&
+                     a->surf_size == b->surf_size && a->total_size == b->total_size &&
+                     a->alignment_log2 == b->alignment_log2 && a->u.gfx9.swizzle_mode == b->u.gfx9.swizzle_mode &&
+                     a->u.gfx9.surf_pitch == b->u.gfx9.surf_pitch && a->u.gfx9.surf_height == b->u.gfx9.surf_height &&
+                     a->u.gfx9.surf_slice_size == b->u.gfx9.surf_slice_size &&
+                     !memcmp(a->u.gfx9.offset, b->u.gfx9.offset, sizeof(a->u.gfx9.offset)) &&
+                     !memcmp(a->u.gfx9.pitch, b->u.gfx9.pitch, sizeof(a->u.gfx9.pitch));
+   if (!same)
+      RADV_LOGI("[BC5ALIAS] %ux%u: plane layouts differ (swizzle %u/%u size %llu/%llu), not aliased",
+                image->vk.extent.width, image->vk.extent.height, a->u.gfx9.swizzle_mode, b->u.gfx9.swizzle_mode,
+                (unsigned long long)a->total_size, (unsigned long long)b->total_size);
+   return same;
+}
+
 VkResult
 radv_image_create_layout(struct radv_device *device, struct radv_image_create_info create_info,
                          const struct VkImageDrmFormatModifierExplicitCreateInfoEXT *mod_info,
@@ -1263,6 +1347,7 @@ radv_image_create_layout(struct radv_device *device, struct radv_image_create_in
    }
 
    unsigned plane_count = radv_get_internal_plane_count(pdev, image->vk.format);
+   image->xclipse_bc_alias = false;
    for (unsigned plane = 0; plane < plane_count; ++plane) {
       struct ac_surf_info info = image_info;
       uint64_t offset;
@@ -1320,6 +1405,10 @@ radv_image_create_layout(struct radv_device *device, struct radv_image_create_in
       } else {
          offset = image->disjoint ? 0 : align64(image->size, 1ull << image->planes[plane].surface.alignment_log2);
          stride = 0; /* 0 means no override */
+         if (plane == 1 && radv_xclipse_bc_can_alias(pdev, image, &create_info)) {
+            offset = image->planes[0].surface.u.gfx9.surf_offset;
+            image->xclipse_bc_alias = true;
+         }
       }
 
       if (!ac_surface_override_offset_stride(&pdev->info, &image->planes[plane].surface, image->vk.array_layers,
@@ -1551,6 +1640,8 @@ radv_image_create(VkDevice _device, const struct radv_image_create_info *create_
       radv_destroy_image(device, alloc, image);
       return result;
    }
+   radv_log_dcc_decision(device, image, create_info->vk_info, image->vk.format, "layout",
+                         radv_image_has_dcc(image) ? NULL : (radv_dcc_why ? radv_dcc_why : "no_dcc"));
 
    if (image->vk.create_flags & VK_IMAGE_CREATE_2_SPARSE_BINDING_BIT_KHR) {
       enum radeon_bo_flag flags = RADEON_FLAG_VIRTUAL;

@@ -18,6 +18,7 @@
 #include "vk_limits.h"
 #include "vk_shader_module.h"
 
+#include "panvk_bc_emu.h"
 #include "panvk_instance.h"
 #include "panvk_buffer.h"
 #include "panvk_cmd_draw.h"
@@ -286,6 +287,10 @@ has_texture_compression_astc_hdr(const struct panvk_physical_device *physical_de
 static bool
 has_texture_compression_bc(const struct panvk_physical_device *physical_device)
 {
+   /* BC1-BC3 in hardware and BC4-BC7 emulated (panvk_bc_emu.h). */
+   if (panvk_bc_emu_supported(physical_device))
+      return true;
+
    return has_compressed_formats(physical_device,
       BITFIELD_BIT(MALI_BC1_UNORM) | BITFIELD_BIT(MALI_BC2_UNORM) |
       BITFIELD_BIT(MALI_BC3_UNORM) | BITFIELD_BIT(MALI_BC4_UNORM) |

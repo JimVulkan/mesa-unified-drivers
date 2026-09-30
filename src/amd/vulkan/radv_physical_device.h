@@ -135,8 +135,15 @@ struct radv_physical_device {
    bool emulate_etc2;
    /* The texture unit has no BC4/BC5/BC6H/BC7 decoder; decode them on the GPU at upload. */
    bool emulate_bc;
+   /* Xclipse, on by default: BC5_UNORM's EAC plane shares plane 0's memory and uploads transcode
+    * straight from the copy's source buffer (radv_image.xclipse_bc_alias). Faster uploads, half the
+    * memory; reads of the image AS BC5 (copies out, uint views) then return EAC data.
+    * RADV_XCLIPSE_BC5_ALIAS=0 or setprop debug.radv_xclipse_bc5_alias 0 turns it off. */
+   bool xclipse_bc5_alias;
    /* Xclipse: DCC on colour targets; RADV_XCLIPSE_DCC=0 / debug.radv_xclipse_dcc 0 turns it off. */
    bool xclipse_dcc;
+   /* Xclipse: DCC also for colour targets of 512x512 and less (debug.radv_xclipse_dcc_small 0 = off). */
+   bool xclipse_dcc_small;
 
    /* Whether to emulate ASTC image support on HW without support. */
    bool emulate_astc;

@@ -26,6 +26,7 @@
 #include "panvk_physical_device.h"
 #include "panvk_priv_bo.h"
 
+#include "kmod/kbase_kmod.h"
 #include "pan_desc.h"
 #include "pan_encoder.h"
 #include "pan_props.h"
@@ -115,8 +116,23 @@ panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
 
       unsigned size = pan_get_total_stack_size(batch->tlsinfo.tls.size,
                                                thread_tls_alloc, core_id_range);
-      batch->tlsinfo.tls.ptr =
-         panvk_cmd_alloc_dev_mem(cmdbuf, tls, size, 4096).gpu;
+
+      /* A stack per batch is a stack per vkCmdDispatch, and the stack is sized for every thread
+       * slot of every core ID: 768 x 23 on the Exynos 9820's G76, so 16 KB per thread made a
+       * 289 MB stack per dispatch and a few dozen dispatches ran the phone out of memory. On
+       * kbase the batches run in order, so they share one. The DRM path can overlap one
+       * batch's fragment job with the next batch's vertex jobs, so it keeps a stack each. */
+      if (pan_kmod_dev_is_kbase(phys_dev->kmod.dev)) {
+         if (size > cmdbuf->tls_stack.size) {
+            cmdbuf->tls_stack.ptr =
+               panvk_cmd_alloc_dev_mem(cmdbuf, tls, size, 4096).gpu;
+            cmdbuf->tls_stack.size = cmdbuf->tls_stack.ptr ? size : 0;
+         }
+         batch->tlsinfo.tls.ptr = cmdbuf->tls_stack.ptr;
+      } else {
+         batch->tlsinfo.tls.ptr =
+            panvk_cmd_alloc_dev_mem(cmdbuf, tls, size, 4096).gpu;
+      }
    }
 
    if (batch->tlsinfo.wls.size) {
@@ -386,6 +402,7 @@ panvk_reset_cmdbuf(struct vk_command_buffer *vk_cmdbuf,
    panvk_pool_reset(&cmdbuf->varying_pool);
    panvk_cmd_buffer_obj_list_reset(cmdbuf, push_sets);
 
+   memset(&cmdbuf->tls_stack, 0, sizeof(cmdbuf->tls_stack));
    memset(&cmdbuf->state, 0, sizeof(cmdbuf->state));
 }
 

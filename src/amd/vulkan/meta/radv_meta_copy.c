@@ -349,6 +349,10 @@ radv_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer, const VkCopyBufferToIm
          .imageExtent = region->imageExtent,
       };
 
+      /* Aliased BC5: nothing to copy, the transcode below reads the buffer and writes EAC. */
+      if (dst_image->xclipse_bc_alias && cmd_buffer->qf != RADV_QUEUE_TRANSFER)
+         continue;
+
       if (cmd_buffer->qf == RADV_QUEUE_TRANSFER) {
          RADV_LOGI("[COPY_BUF2IMG] route=SDMA qf=%u fmt=%u extent=%ux%ux%u",
                    cmd_buffer->qf, dst_image->vk.format,
@@ -364,14 +368,27 @@ radv_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer, const VkCopyBufferToIm
    }
 
    if (radv_is_format_emulated(pdev, dst_image->vk.format) && cmd_buffer->qf != RADV_QUEUE_TRANSFER) {
-      cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_CS_PARTIAL_FLUSH | RADV_CMD_FLAG_PS_PARTIAL_FLUSH |
-                                      radv_src_access_flush(cmd_buffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-                                                            VK_ACCESS_2_TRANSFER_WRITE_BIT, 0, dst_image, NULL) |
-                                      radv_dst_access_flush(cmd_buffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-                                                            VK_ACCESS_2_TRANSFER_READ_BIT, 0, dst_image, NULL);
+      /* Orders our copy into plane 0 before the decode reads it. The aliased path copies nothing. */
+      if (!dst_image->xclipse_bc_alias)
+         cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_CS_PARTIAL_FLUSH | RADV_CMD_FLAG_PS_PARTIAL_FLUSH |
+                                         radv_src_access_flush(cmd_buffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                                               VK_ACCESS_2_TRANSFER_WRITE_BIT, 0, dst_image, NULL) |
+                                         radv_dst_access_flush(cmd_buffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                                               VK_ACCESS_2_TRANSFER_READ_BIT, 0, dst_image, NULL);
 
       const enum util_format_layout format_layout = radv_format_description(dst_image->vk.format)->layout;
       for (unsigned r = 0; r < pCopyBufferToImageInfo->regionCount; r++) {
+         if (dst_image->xclipse_bc_alias) {
+            const VkBufferImageCopy2 *region = &pCopyBufferToImageInfo->pRegions[r];
+            const VkExtent3D ext = vk_image_sanitize_extent(&dst_image->vk, region->imageExtent);
+            radv_meta_decode_bc_from_buffer(
+               cmd_buffer, dst_image, pCopyBufferToImageInfo->dstImageLayout, &region->imageSubresource,
+               region->imageOffset, region->imageExtent,
+               vk_device_address_range(&src_buffer->vk, region->bufferOffset, VK_WHOLE_SIZE).address,
+               region->bufferRowLength ? region->bufferRowLength : ext.width,
+               region->bufferImageHeight ? region->bufferImageHeight : ext.height);
+            continue;
+         }
          if (format_layout == UTIL_FORMAT_LAYOUT_ASTC) {
             radv_meta_decode_astc(cmd_buffer, dst_image, pCopyBufferToImageInfo->dstImageLayout,
                                   &pCopyBufferToImageInfo->pRegions[r].imageSubresource,
@@ -919,11 +936,14 @@ radv_CmdCopyImage2(VkCommandBuffer commandBuffer, const VkCopyImageInfo2 *pCopyI
                                   &pCopyImageInfo->pRegions[r].dstSubresource, pCopyImageInfo->pRegions[r].dstOffset,
                                   dst_extent);
          } else {
-            if (radv_bc_emulation_format(dst_image->vk.format) != VK_FORMAT_UNDEFINED)
-               radv_meta_decode_bc(cmd_buffer, dst_image, pCopyImageInfo->dstImageLayout,
-                                   &pCopyImageInfo->pRegions[r].dstSubresource,
-                                   pCopyImageInfo->pRegions[r].dstOffset, pCopyImageInfo->pRegions[r].extent);
-            else
+            if (radv_bc_emulation_format(dst_image->vk.format) != VK_FORMAT_UNDEFINED) {
+               /* Aliased BC5 to aliased BC5: plane 0 already held EAC and was copied as it is; a
+                * decode would read it as BC5. */
+               if (!(dst_image->xclipse_bc_alias && src_image->xclipse_bc_alias))
+                  radv_meta_decode_bc(cmd_buffer, dst_image, pCopyImageInfo->dstImageLayout,
+                                      &pCopyImageInfo->pRegions[r].dstSubresource,
+                                      pCopyImageInfo->pRegions[r].dstOffset, pCopyImageInfo->pRegions[r].extent);
+            } else
             radv_meta_decode_etc(cmd_buffer, dst_image, pCopyImageInfo->dstImageLayout,
                                  &pCopyImageInfo->pRegions[r].dstSubresource, pCopyImageInfo->pRegions[r].dstOffset,
                                  dst_extent);

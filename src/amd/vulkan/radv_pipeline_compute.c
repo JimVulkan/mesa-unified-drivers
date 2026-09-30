@@ -15,6 +15,7 @@
 #include "util/mesa-blake3.h"
 #include "util/os_time.h"
 #include "vk_xclipse_perf.h"
+#include "util/u_xclipse_prof.h"
 #include "util/u_atomic.h"
 #include "radv_pipeline_binary.h"
 #include "radv_pipeline_cache.h"
@@ -347,10 +348,14 @@ radv_CreateComputePipelines(VkDevice _device, VkPipelineCache pipelineCache, uin
 {
    /* Perf accounting, off by default. See vk_xclipse_perf.h. */
    const bool xperf = vk_xclipse_perf_enabled();
-   const uint64_t xperf_t0 = xperf ? os_time_get_nano() : 0;
+   const bool xprof = u_xclipse_prof_active();
+   const uint64_t xperf_t0 = xperf || xprof ? os_time_get_nano() : 0;
 
    VkResult result =
       radv_create_compute_pipelines(_device, pipelineCache, count, pCreateInfos, pAllocator, pPipelines);
+
+   if (xprof)
+      u_xclipse_prof_pipeline(os_time_get_nano() - xperf_t0, count, false);
 
    if (xperf)
       vk_xclipse_perf_pipeline(os_time_get_nano() - xperf_t0, count, 0 /* no GS in compute */);

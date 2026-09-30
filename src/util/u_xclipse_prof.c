@@ -14,6 +14,13 @@
  * thread's own stack mapping; the header gives frames presented and per-thread CPU time over the
  * window. Symbolize with tools/profsym.py.
  *
+ * Under Wine/FEX (Winlator-style emulators) the delay can't be timed to a scene and $TMPDIR is the
+ * app's private directory, so: "t,<seconds>[,g]" arms a TRIGGERED window instead, run each time
+ * the property debug.mesa_xclipse_prof_go changes (any number of windows per process); ",g" skips
+ * the CPU sampling (no SIGPROF, only per-thread CPU time and the GPU); the property
+ * debug.mesa_xclipse_prof_dir picks the directory; and every "#" line of the report also goes to
+ * logcat (tag XPROF).
+ *
  * Nothing here runs on a GPU-waited thread: the signal handler only stores to memory, and all
  * file I/O happens on the helper thread.
  */
@@ -21,6 +28,7 @@
 
 #include "u_xclipse_prof.h"
 
+#include <android/log.h>
 #include <dirent.h>
 #include <dlfcn.h>
 #include <pthread.h>
@@ -61,6 +69,8 @@ struct prof_thread {
 };
 
 static int prof_delay = -1, prof_seconds;
+static bool prof_trigger, prof_nocpu;
+static unsigned prof_window;
 static struct prof_sample *prof_buf;
 static atomic_uint prof_n;
 static atomic_int prof_on;
@@ -87,9 +97,18 @@ prof_config(void)
       e = v;
    if (e && e[0]) {
       int d = -1, s = 20;
-      if (sscanf(e, "%d,%d", &d, &s) >= 1 && d >= 0 && s > 0) {
+      if (e[0] == 't') {
+         prof_trigger = true;
+         d = 0;
+         if (sscanf(e + 1, ",%d", &s) < 1 || s <= 0)
+            s = 20;
+      } else if (sscanf(e, "%d,%d", &d, &s) < 1 || s <= 0) {
+         d = -1;
+      }
+      if (d >= 0) {
          prof_delay = d;
          prof_seconds = s;
+         prof_nocpu = strstr(e, ",g") != NULL;
       }
    }
    atomic_store(&done, 1);
@@ -115,6 +134,22 @@ u_xclipse_prof_wait(enum u_xclipse_wait kind, int64_t ns)
       return;
    atomic_fetch_add_explicit(&prof_wait_ns[kind], ns, memory_order_relaxed);
    atomic_fetch_add_explicit(&prof_wait_n[kind], 1, memory_order_relaxed);
+}
+
+static atomic_llong prof_pipe_ns, prof_pipe_max_ns;
+static atomic_uint prof_pipe_n, prof_pipe_lib_n, prof_pipe_calls;
+
+__attribute__((visibility("default"))) void
+u_xclipse_prof_pipeline(int64_t ns, unsigned count, bool library)
+{
+   if (!atomic_load_explicit(&prof_on, memory_order_relaxed))
+      return;
+   atomic_fetch_add_explicit(&prof_pipe_ns, ns, memory_order_relaxed);
+   atomic_fetch_add_explicit(library ? &prof_pipe_lib_n : &prof_pipe_n, count, memory_order_relaxed);
+   atomic_fetch_add_explicit(&prof_pipe_calls, 1, memory_order_relaxed);
+   long long cur = atomic_load_explicit(&prof_pipe_max_ns, memory_order_relaxed);
+   while (ns > cur && !atomic_compare_exchange_weak(&prof_pipe_max_ns, &cur, ns))
+      ;
 }
 
 static pthread_mutex_t prof_gpu_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -295,7 +330,7 @@ prof_scan_threads(void)
       ev.sigev_notify = SIGEV_THREAD_ID;
       ev.sigev_signo = SIGPROF;
       ev._sigev_un._tid = tid;
-      if (timer_create(clk, &ev, &t->timer) == 0) {
+      if (!prof_nocpu && timer_create(clk, &ev, &t->timer) == 0) {
          struct itimerspec it = {{0, 4000000}, {0, 4000000}};
          timer_settime(t->timer, 0, &it, NULL);
          t->has_timer = true;
@@ -305,10 +340,11 @@ prof_scan_threads(void)
 }
 
 static FILE *
-prof_open(void)
+prof_open(char *path, size_t path_size)
 {
-   char path[512], pkg[256] = {0};
-   const char *dirs[4] = {getenv("MESA_XCLIPSE_PROF_DIR"), getenv("TMPDIR"), NULL,
+   char pkg[256] = {0}, propdir[PROP_VALUE_MAX] = {0};
+   __system_property_get("debug.mesa_xclipse_prof_dir", propdir);
+   const char *dirs[5] = {getenv("MESA_XCLIPSE_PROF_DIR"), propdir, getenv("TMPDIR"), NULL,
                           "/data/local/tmp"};
    /* An app launched without an environment (Eden, any APK) still has its own external files
     * directory: the process name is the package, up to a ':' for secondary processes. */
@@ -324,12 +360,12 @@ prof_open(void)
    char appdir[320];
    if (pkg[0] && strchr(pkg, '.')) {
       snprintf(appdir, sizeof(appdir), "/sdcard/Android/data/%s/files", pkg);
-      dirs[2] = appdir;
+      dirs[3] = appdir;
    }
-   for (int i = 0; i < 4; i++) {
+   for (int i = 0; i < 5; i++) {
       if (!dirs[i] || !dirs[i][0])
          continue;
-      snprintf(path, sizeof(path), "%s/mesa_prof_%d.txt", dirs[i], getpid());
+      snprintf(path, path_size, "%s/mesa_prof_%d_%u.txt", dirs[i], getpid(), prof_window);
       FILE *f = fopen(path, "w");
       if (f)
          return f;
@@ -340,11 +376,13 @@ prof_open(void)
 static void
 prof_write(double seconds, unsigned frames)
 {
-   FILE *f = prof_open();
+   char *hdr = NULL;
+   size_t hdr_len = 0;
+   FILE *f = open_memstream(&hdr, &hdr_len);
    if (!f)
       return;
-   fprintf(f, "# seconds %.2f frames %u fps %.1f clk_tck %ld\n", seconds, frames,
-           frames / seconds, sysconf(_SC_CLK_TCK));
+   fprintf(f, "# window %u seconds %.2f frames %u fps %.1f clk_tck %ld\n", prof_window, seconds,
+           frames, frames / seconds, sysconf(_SC_CLK_TCK));
    for (int k = 0; k < prof_nthreads; k++) {
       struct prof_thread *t = &prof_threads[k];
       strcpy(t->comm, "?");
@@ -365,6 +403,39 @@ prof_write(double seconds, unsigned frames)
    for (int k = 0; k < U_XCLIPSE_WAIT_COUNT; k++)
       fprintf(f, "# wait %s ms %lld count %u\n", prof_wait_names[k],
               (long long)atomic_load(&prof_wait_ns[k]) / 1000000, atomic_load(&prof_wait_n[k]));
+   fprintf(f, "# pipelines created %u, libraries %u, in %u calls: %lld ms total, longest %lld ms\n",
+           atomic_load(&prof_pipe_n), atomic_load(&prof_pipe_lib_n), atomic_load(&prof_pipe_calls),
+           (long long)atomic_load(&prof_pipe_ns) / 1000000, (long long)atomic_load(&prof_pipe_max_ns) / 1000000);
+   fclose(f);
+
+   /* The summary to logcat, which adb can read whatever the app may write. */
+   for (char *line = hdr, *nl; line && *line; line = nl ? nl + 1 : NULL) {
+      nl = strchr(line, '\n');
+      if (nl)
+         *nl = 0;
+      __android_log_print(ANDROID_LOG_INFO, "XPROF", "%s", line);
+      if (nl)
+         *nl = '\n';
+   }
+
+   char path[512];
+   f = prof_open(path, sizeof(path));
+   if (!f) {
+      free(hdr);
+      return;
+   }
+   fwrite(hdr, 1, hdr_len, f);
+   free(hdr);
+   /* Executable mappings, so samples in code dladdr does not know (Wine's PE images: DXVK, the
+    * game, FEX) can be attributed offline. */
+   FILE *maps = fopen("/proc/self/maps", "r");
+   if (maps) {
+      char line[512];
+      while (fgets(line, sizeof(line), maps))
+         if (strstr(line, " r-xp ") || strstr(line, " r-x"))
+            fprintf(f, "# map %s", line);
+      fclose(maps);
+   }
    unsigned n = atomic_load(&prof_n);
    if (n > PROF_SAMPLES)
       n = PROF_SAMPLES;
@@ -390,6 +461,7 @@ prof_write(double seconds, unsigned frames)
       fputc('\n', f);
    }
    fclose(f);
+   __android_log_print(ANDROID_LOG_INFO, "XPROF", "# written %s", path);
 }
 
 static double
@@ -400,11 +472,21 @@ prof_now(void)
    return t.tv_sec + t.tv_nsec / 1e9;
 }
 
-static void *
-prof_thread_main(void *arg)
+static void
+prof_run_window(void)
 {
-   (void)arg;
-   sleep(prof_delay);
+   prof_window++;
+   prof_nthreads = 0;
+   atomic_store(&prof_n, 0);
+   for (int k = 0; k < U_XCLIPSE_WAIT_COUNT; k++) {
+      atomic_store(&prof_wait_ns[k], 0);
+      atomic_store(&prof_wait_n[k], 0);
+   }
+   atomic_store(&prof_pipe_ns, 0);
+   atomic_store(&prof_pipe_max_ns, 0);
+   atomic_store(&prof_pipe_n, 0);
+   atomic_store(&prof_pipe_lib_n, 0);
+   atomic_store(&prof_pipe_calls, 0);
    prof_scan_stacks();
    const unsigned f0 = atomic_load(&prof_frames);
    const double t0 = prof_now();
@@ -418,9 +500,36 @@ prof_thread_main(void *arg)
    const double seconds = prof_now() - t0;
    const unsigned frames = atomic_load(&prof_frames) - f0;
    for (int k = 0; k < prof_nthreads; k++)
-      if (prof_threads[k].has_timer)
+      if (prof_threads[k].has_timer) {
          timer_delete(prof_threads[k].timer);
+         prof_threads[k].has_timer = false;
+      }
    prof_write(seconds, frames);
+}
+
+static void *
+prof_thread_main(void *arg)
+{
+   (void)arg;
+   if (!prof_trigger) {
+      sleep(prof_delay);
+      prof_run_window();
+      return NULL;
+   }
+   char last[PROP_VALUE_MAX] = {0};
+   __system_property_get("debug.mesa_xclipse_prof_go", last);
+   __android_log_print(ANDROID_LOG_INFO, "XPROF",
+                       "# armed pid %d: changing debug.mesa_xclipse_prof_go runs a %d s window%s",
+                       getpid(), prof_seconds, prof_nocpu ? " (GPU and thread times only)" : "");
+   for (;;) {
+      usleep(250000);
+      char v[PROP_VALUE_MAX] = {0};
+      __system_property_get("debug.mesa_xclipse_prof_go", v);
+      if (strcmp(v, last)) {
+         strcpy(last, v);
+         prof_run_window();
+      }
+   }
    return NULL;
 }
 
@@ -431,20 +540,23 @@ u_xclipse_prof_start(void)
    if (!u_xclipse_prof_armed() || atomic_exchange(&started, 1))
       return;
 
-   /* Never take SIGPROF from someone else (a profiler already attached). */
+   /* Never take SIGPROF from someone else (a profiler already attached): then measure without
+    * CPU samples. */
    struct sigaction old;
    if (sigaction(SIGPROF, NULL, &old) || (old.sa_handler != SIG_DFL && old.sa_handler != SIG_IGN))
-      return;
+      prof_nocpu = true;
 
-   prof_buf = calloc(PROF_SAMPLES, sizeof(*prof_buf));
+   prof_buf = calloc(prof_nocpu ? 1 : PROF_SAMPLES, sizeof(*prof_buf));
    if (!prof_buf)
       return;
-   struct sigaction sa;
-   memset(&sa, 0, sizeof(sa));
-   sa.sa_sigaction = prof_handler;
-   sa.sa_flags = SA_SIGINFO | SA_RESTART;
-   sigemptyset(&sa.sa_mask);
-   sigaction(SIGPROF, &sa, NULL);
+   if (!prof_nocpu) {
+      struct sigaction sa;
+      memset(&sa, 0, sizeof(sa));
+      sa.sa_sigaction = prof_handler;
+      sa.sa_flags = SA_SIGINFO | SA_RESTART;
+      sigemptyset(&sa.sa_mask);
+      sigaction(SIGPROF, &sa, NULL);
+   }
 
    /* The helper samples nothing itself. */
    sigset_t all, saved;

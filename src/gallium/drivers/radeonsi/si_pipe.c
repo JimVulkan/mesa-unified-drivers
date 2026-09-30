@@ -219,21 +219,23 @@ static struct pipe_screen *radeonsi_screen_create_impl(struct radeon_winsys *ws,
 
    /* Samsung Xclipse 920: GFX10_3 registers, GFX11 shader core and texture unit. Where the two
     * disagree, run it the way RADV does on this chip:
-    *   - no DCC: the texture unit can't decode the GFX10.3 DCC the CB writes (samples black)
     *   - no FMASK: MSAA the GFX11 way (ac_surface also drops MSAA CMASK)
     *   - no NGG culling: back-to-back culling draws hang without a VGT_FLUSH between them
     */
    if (sscreen->info.gfx11_shader_core) {
       sscreen->debug_flags |= DBG(NO_FMASK) | DBG(NO_NGG_CULLING);
-      /* DCC: on by default on the Xclipse 530 (Minecraft 30 -> 46 fps), not yet tested in radeonsi
-       * on the 920. MESA_XCLIPSE_DCC or debug.mesa_xclipse_dcc: 1 turns it on, 0 off. */
+      /* DCC: on by default on both chips, as in RADV. The 530 went 30 -> 46 fps in Minecraft. On
+       * the 920, render targets sampled back (glprobe rtt: 1280x720 RGBA8/RGBA16F/R11G11B10F/RGB10A2,
+       * fast clear, draw, upload, generated mips) read the same with DCC as without, and Minecraft
+       * with a shader pack ran smoother. MESA_XCLIPSE_DCC or debug.mesa_xclipse_dcc: 0 turns it off,
+       * 1 on. */
       const char *dcc = getenv("MESA_XCLIPSE_DCC");
 #if DETECT_OS_ANDROID
       char prop[PROP_VALUE_MAX] = {0};
       if (!(dcc && dcc[0]) && __system_property_get("debug.mesa_xclipse_dcc", prop) > 0)
          dcc = prop;
 #endif
-      const bool use_dcc = dcc && dcc[0] ? dcc[0] == '1' : sscreen->info.family == CHIP_TITAN;
+      const bool use_dcc = dcc && dcc[0] ? dcc[0] == '1' : true;
       if (!use_dcc)
          sscreen->debug_flags |= DBG(NO_DCC);
    }

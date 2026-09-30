@@ -15,6 +15,7 @@
 #include "vk_log.h"
 #include "vk_ycbcr_conversion.h"
 
+#include "panvk_bc_emu.h"
 #include "panvk_device.h"
 #include "panvk_entrypoints.h"
 #include "panvk_image.h"
@@ -341,6 +342,25 @@ panvk_per_arch(CreateImageView)(VkDevice _device,
          view->vk.view_format = vk_format_stencil_only(view->vk.view_format);
    }
 
+   /* BC4-BC7 emulated on this texture unit (panvk_bc_emu.h): a view in a BC format samples the
+    * hidden plane 1 in its carrier format. The transcoder's storage view names PLANE_1 itself; when
+    * the carrier is not block-compressed, that view is in texels rather than blocks. */
+   bool bc_emu_view = false, bc_emu_alpha = false;
+   const struct panvk_physical_device *bc_pdev = to_panvk_physical_device(device->vk.physical);
+   if (panvk_bc_emu_format(bc_pdev, image->vk.format)) {
+      const VkFormat carrier = panvk_bc_emu_carrier(bc_pdev, view->vk.view_format);
+      if (view->vk.aspects == VK_IMAGE_ASPECT_PLANE_1_BIT) {
+         if (!vk_format_is_compressed(panvk_bc_emu_carrier(bc_pdev, image->vk.format)))
+            view->vk.extent = vk_image_mip_level_extent(&image->vk, view->vk.base_mip_level);
+      } else if (carrier != VK_FORMAT_UNDEFINED) {
+         bc_emu_view = true;
+         bc_emu_alpha = view->vk.view_format == VK_FORMAT_BC4_UNORM_BLOCK &&
+                        carrier == VK_FORMAT_BC3_UNORM_BLOCK;
+         view->vk.view_format = carrier;
+         view->vk.format = carrier;
+      }
+   }
+
    enum pipe_format pfmt = vk_format_to_pipe_format(view->vk.view_format);
    const VkImageViewASTCDecodeModeEXT *astc_decode =
       vk_find_struct_const(pCreateInfo->pNext, IMAGE_VIEW_ASTC_DECODE_MODE_EXT);
@@ -393,6 +413,14 @@ panvk_per_arch(CreateImageView)(VkDevice _device,
       }
    }
    vk_component_mapping_to_pipe_swizzle(view->vk.swizzle, view->pview.swizzle);
+   if (bc_emu_alpha) {
+      /* BC4 rides in BC3's alpha half: (A, 0, 0, 1) under the view's own swizzle. */
+      static const unsigned char a001[4] = {PIPE_SWIZZLE_W, PIPE_SWIZZLE_0, PIPE_SWIZZLE_0,
+                                            PIPE_SWIZZLE_1};
+      unsigned char app[4];
+      memcpy(app, view->pview.swizzle, sizeof(app));
+      util_format_compose_swizzles(a001, app, view->pview.swizzle);
+   }
 
    u_foreach_bit(aspect_bit, view->vk.aspects) {
       uint8_t image_plane = panvk_plane_index(image, 1u << aspect_bit);
@@ -407,6 +435,13 @@ panvk_per_arch(CreateImageView)(VkDevice _device,
       view->pview.planes[view_plane] = (struct pan_image_plane_ref){
          .image = PAN_IMAGE_FROM(PAN_ARCH, image, image_plane),
          .plane_idx = PAN_IMAGE_PLANE_INDEX_FROM(PAN_ARCH, image, image_plane),
+      };
+   }
+
+   if (bc_emu_view) {
+      view->pview.planes[0] = (struct pan_image_plane_ref){
+         .image = &image->planes[1].image,
+         .plane_idx = 0,
       };
    }
 

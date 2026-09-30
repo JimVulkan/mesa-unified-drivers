@@ -12,6 +12,7 @@
 #include "vk_device.h"
 #include "vk_meta.h"
 
+#include "panvk_bc_emu.h"
 #include "panvk_blend.h"
 #include "panvk_instance.h"
 #include "panvk_macros.h"
@@ -102,6 +103,9 @@ struct panvk_device {
    } tiler_oom;
 
    struct vk_meta_device meta;
+
+   /* BC4-BC7 emulation's lookup buffer, made on first use (panvk_bc_emu.h). */
+   struct panvk_bc_emu_state bc_emu;
 
    struct {
       struct panvk_pool rw;

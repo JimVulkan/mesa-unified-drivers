@@ -30,6 +30,7 @@
 #include "vk_util.h"
 
 #include "panvk_android.h"
+#include "panvk_bc_emu.h"
 #include "panvk_device.h"
 #include "panvk_entrypoints.h"
 #include "panvk_image.h"
@@ -878,7 +879,10 @@ get_image_plane_format_features(struct panvk_physical_device *physical_device,
    const struct pan_format fmt = physical_device->formats.all[pfmt];
    unsigned arch = pan_arch(physical_device->kmod.dev->props.gpu_id);
 
-   if (!format_is_supported(physical_device, fmt, pfmt))
+   /* BC4-BC7 are emulated where the texture unit has no decoder for them (panvk_bc_emu.h). Their
+    * features are those of any compressed format here: sampled, filtered, transfer, blit source. */
+   const bool bc_emu = panvk_bc_emu_format(physical_device, format);
+   if (!bc_emu && !format_is_supported(physical_device, fmt, pfmt))
       return 0;
 
    if (fmt.bind & PAN_BIND_SAMPLER_VIEW) {
@@ -928,7 +932,8 @@ get_image_plane_format_features(struct panvk_physical_device *physical_device,
    if (fmt.bind & PAN_BIND_DEPTH_STENCIL)
       features |= VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT;
 
-   if (features != 0)
+   /* Not for emulated BC: a host copy would not refill the hidden plane. */
+   if (features != 0 && !bc_emu)
       features |= VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT;
 
    return features;
@@ -1250,6 +1255,23 @@ get_image_format_properties(struct panvk_physical_device *physical_device,
    VkImageUsageFlags all_usage = info->usage | stencil_usage;
    const struct vk_format_ycbcr_info *ycbcr_info =
       vk_format_get_ycbcr_info(info->format);
+
+   /* Emulated BC formats (panvk_bc_emu.h): 2D and 3D, optimal and linear, as their native
+    * counterparts. Not 1D (no BC format is), and one allocation, no sparse, no host copies, and
+    * nothing that writes the blocks except copies, which the transcoder follows. A linear image
+    * the host writes is refreshed before each submission on the kbase path only. */
+   if (panvk_bc_emu_format(physical_device, info->format) &&
+       (info->type == VK_IMAGE_TYPE_1D ||
+        (info->tiling == VK_IMAGE_TILING_LINEAR &&
+         !pan_kmod_dev_is_kbase(physical_device->kmod.dev)) ||
+        info->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT ||
+        (info->flags & (VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
+                        VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT | VK_IMAGE_CREATE_DISJOINT_BIT)) ||
+        (all_usage & (VK_IMAGE_USAGE_HOST_TRANSFER_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                      VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT))))
+      goto unsupported;
 
    if (info->flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) {
       if (!physical_device->vk.supported_features.sparseBinding)

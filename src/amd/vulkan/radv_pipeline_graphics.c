@@ -18,6 +18,7 @@
 #include "util/mesa-blake3.h"
 #include "util/os_time.h"
 #include "vk_xclipse_perf.h"
+#include "util/u_xclipse_prof.h"
 
 #if DETECT_OS_ANDROID
 #include <android/log.h>
@@ -3547,7 +3548,8 @@ radv_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache, ui
    /* Perf accounting, off by default (vk_xclipse_perf.h): pipeline creation on the render thread
     * is a frame stall. */
    const bool xperf = vk_xclipse_perf_enabled();
-   const uint64_t xperf_t0 = xperf ? os_time_get_nano() : 0;
+   const bool xprof = u_xclipse_prof_active();
+   const uint64_t xperf_t0 = xperf || xprof ? os_time_get_nano() : 0;
 
    for (; i < count; i++) {
       const VkPipelineCreateFlagBits2 create_flags = vk_graphics_pipeline_create_flags(&pCreateInfos[i]);
@@ -3568,6 +3570,11 @@ radv_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache, ui
 
    for (; i < count; ++i)
       pPipelines[i] = VK_NULL_HANDLE;
+
+   if (xprof)
+      u_xclipse_prof_pipeline(os_time_get_nano() - xperf_t0, count,
+                              count && (vk_graphics_pipeline_create_flags(&pCreateInfos[0]) &
+                                        VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR));
 
    if (xperf) {
       /* Count pipelines with a geometry stage (does toggling an extension change GS fallback use?). */

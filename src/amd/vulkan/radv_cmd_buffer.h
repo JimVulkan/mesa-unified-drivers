@@ -645,6 +645,8 @@ struct radv_cmd_buffer {
    uint32_t xprof_pass;
    uint32_t xprof_draws;
    const struct radv_shader *xprof_ps;
+   uintptr_t xprof_op; /* the function that began the current meta op (field profiler) */
+   uint32_t xprof_rt;  /* pass slot + 1 opened by the current rendering, 0 outside one */
 };
 
 struct radv_msrtss_transient {

@@ -225,6 +225,9 @@ static const uint32_t bc_decoder_eac_spv[] = {
 static const uint32_t bc_decoder_bc3_spv[] = {
 #include "bc_decoder_bc3_spv.h"
 };
+static const uint32_t bc_decoder_eacbuf_spv[] = {
+#include "bc_decoder_eacbuf_spv.h"
+};
 
 /* Keep in sync with bc_decoder.glsl. */
 enum bc_shader_format {
@@ -247,6 +250,8 @@ enum bc_variant {
    BC_VARIANT_EAC = 4,
    /* Decode, then re-encode into a BC3 plane (the BC7 carrier, no endpoint search). */
    BC_VARIANT_BC3 = 5,
+   /* BC_VARIANT_EAC reading the copy's source buffer instead of plane 0 (aliased BC5, one pass). */
+   BC_VARIANT_EAC_BUF = 6,
    BC_VARIANT_COUNT,
 };
 
@@ -363,7 +368,7 @@ get_pipeline_layout(struct radv_device *device, VkPipelineLayout *layout_out)
 
    const VkPushConstantRange pc_range = {
       .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
-      .size = 32,
+      .size = 48,
    };
 
    return vk_meta_get_pipeline_layout(&device->vk, &device->meta_state.device, &desc_info, &pc_range, &key, sizeof(key),
@@ -415,6 +420,10 @@ get_pipeline(struct radv_device *device, enum bc_variant variant, VkPipeline *pi
       spv = bc_decoder_bc3_spv;
       spv_size = sizeof(bc_decoder_bc3_spv);
       break;
+   case BC_VARIANT_EAC_BUF:
+      spv = bc_decoder_eacbuf_spv;
+      spv_size = sizeof(bc_decoder_eacbuf_spv);
+      break;
    default:
       spv = bc_decoder_unorm8_spv;
       spv_size = sizeof(bc_decoder_unorm8_spv);
@@ -456,7 +465,7 @@ get_pipeline(struct radv_device *device, enum bc_variant variant, VkPipeline *pi
    /* Log compile time per variant (each compiles at most once per process). */
    {
       static const char *const vname[BC_VARIANT_COUNT] = {
-         "unorm8", "snorm8", "f16", "u32x4", "eac", "bc3"};
+         "unorm8", "snorm8", "f16", "u32x4", "eac", "bc3", "eacbuf"};
       AC_XCLIPSE_LOGP(ANDROID_LOG_INFO, "RADV_KILL", "[BCCOMPILE] variant=%s %.0f ms",
                           (variant >= 0 && variant < BC_VARIANT_COUNT) ? vname[variant] : "?",
                           (double)_cc_ns / 1e6);
@@ -579,9 +588,12 @@ bc_content_slot(struct radv_device *device, uint32_t w, uint32_t h)
 
 #endif
 
-void
-radv_meta_decode_bc(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image, VkImageLayout layout,
-                    const VkImageSubresourceLayers *subresource, VkOffset3D offset, VkExtent3D extent)
+/* src_va != 0: read the blocks from that address (the copy's source buffer, pitches in blocks)
+ * instead of plane 0. BC5 into an aliased image only. */
+static void
+bc_decode(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image, VkImageLayout layout,
+          const VkImageSubresourceLayers *subresource, VkOffset3D offset, VkExtent3D extent, uint64_t src_va,
+          uint32_t src_row_blocks, uint32_t src_slice_blocks)
 {
    RADV_CPU_T0();
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
@@ -590,7 +602,8 @@ radv_meta_decode_bc(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image
    VkPipelineLayout p_layout;
 
    const uint64_t _pipe_t0 = radv_cpushare_now();
-   const VkResult _pipe_r = get_pipeline(device, bc_variant(format), &pipeline, &p_layout);
+   const VkResult _pipe_r =
+      get_pipeline(device, src_va ? BC_VARIANT_EAC_BUF : bc_variant(format), &pipeline, &p_layout);
    radv_cpushare_add(RADV_CPU_PIPELINE, radv_cpushare_now() - _pipe_t0);
    if (_pipe_r != VK_SUCCESS) {
       vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
@@ -619,30 +632,34 @@ radv_meta_decode_bc(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image
       bc_rpt_track(image, subresource->mipLevel, format, extent.width, extent.height);
 #endif
 
-   /* Source: the compressed plane, viewed as uint texels, one per 4x4 block. */
+   /* Source: the compressed plane, viewed as uint texels, one per 4x4 block. Not built when the
+    * blocks come from a buffer: binding 0 is then a null (zeroed) descriptor the shader never reads,
+    * and one image view less is CPU work saved on every upload. */
    const VkImageViewUsage2CreateInfoKHR src_usage = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_2_CREATE_INFO_KHR,
       .usage = VK_IMAGE_USAGE_2_SAMPLED_BIT_KHR,
    };
    struct radv_image_view src_iview;
-   radv_image_view_init(&src_iview, device,
-                        &(VkImageViewCreateInfo){
-                           .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-                           .pNext = &src_usage,
-                           .flags = VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA,
-                           .image = radv_image_to_handle(image),
-                           .viewType = view_type,
-                           .format = bc_load_format(format),
-                           .subresourceRange =
-                              {
-                                 .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                                 .baseMipLevel = subresource->mipLevel,
-                                 .levelCount = 1,
-                                 .baseArrayLayer = 0,
-                                 .layerCount = layer_end,
-                              },
-                        },
-                        NULL);
+   if (!src_va) {
+      radv_image_view_init(&src_iview, device,
+                           &(VkImageViewCreateInfo){
+                              .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+                              .pNext = &src_usage,
+                              .flags = VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA,
+                              .image = radv_image_to_handle(image),
+                              .viewType = view_type,
+                              .format = bc_load_format(format),
+                              .subresourceRange =
+                                 {
+                                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                    .baseMipLevel = subresource->mipLevel,
+                                    .levelCount = 1,
+                                    .baseArrayLayer = 0,
+                                    .layerCount = layer_end,
+                                 },
+                           },
+                           NULL);
+   }
 
    /* Destination: the hidden decoded plane. */
    const VkImageViewUsage2CreateInfoKHR dst_usage = {
@@ -676,7 +693,7 @@ radv_meta_decode_bc(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image
                                   .data.pSampledImage =
                                      (VkDescriptorImageInfo[]){
                                         {.sampler = VK_NULL_HANDLE,
-                                         .imageView = radv_image_view_to_handle(&src_iview),
+                                         .imageView = src_va ? VK_NULL_HANDLE : radv_image_view_to_handle(&src_iview),
                                          .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
                                      }},
                                  {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT,
@@ -710,9 +727,10 @@ radv_meta_decode_bc(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image
 #else
    const int hash_slot = -1;
 #endif
-   const unsigned push_constants[8] = {
+   const unsigned push_constants[12] = {
       offset.x, offset.y, base_slice, bc_shader_format(format), image->vk.image_type,
       extent.width, extent.height, (unsigned)hash_slot,
+      (unsigned)src_va, (unsigned)(src_va >> 32), src_row_blocks, src_slice_blocks,
    };
    radv_meta_push_constants(cmd_buffer, p_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_constants),
                             push_constants);
@@ -843,9 +861,27 @@ radv_meta_decode_bc(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image
    }
 #endif
 
-   radv_image_view_finish(&src_iview);
+   if (!src_va)
+      radv_image_view_finish(&src_iview);
    radv_image_view_finish(&dst_iview);
    RADV_CPU_T1(RADV_CPU_DECODE);
+}
+
+void
+radv_meta_decode_bc(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image, VkImageLayout layout,
+                    const VkImageSubresourceLayers *subresource, VkOffset3D offset, VkExtent3D extent)
+{
+   bc_decode(cmd_buffer, image, layout, subresource, offset, extent, 0, 0, 0);
+}
+
+void
+radv_meta_decode_bc_from_buffer(struct radv_cmd_buffer *cmd_buffer, struct radv_image *image, VkImageLayout layout,
+                                const VkImageSubresourceLayers *subresource, VkOffset3D offset, VkExtent3D extent,
+                                uint64_t src_va, uint32_t row_texels, uint32_t image_height_texels)
+{
+   const uint32_t row_blocks = DIV_ROUND_UP(row_texels, 4);
+   bc_decode(cmd_buffer, image, layout, subresource, offset, extent, src_va, row_blocks,
+             row_blocks * DIV_ROUND_UP(image_height_texels, 4));
 }
 
 /* Order the decode dispatches against everything that follows. Call once after a run of

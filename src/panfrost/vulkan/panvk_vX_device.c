@@ -10,6 +10,9 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include "drm-uapi/panthor_drm.h"
 
 #include "vk_cmd_enqueue_entrypoints.h"
@@ -520,9 +523,20 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
       .free = panvk_kmod_free,
       .priv = &device->vk.alloc,
    };
-   device->kmod.dev = pan_kmod_dev_create(
-      os_dupfd_cloexec(physical_device->kmod.dev->fd),
-      physical_device->kmod.dev->flags, &device->kmod.allocator);
+   /* On kbase a context belongs to the open file, not to the fd: a dup shares it, with its atom
+    * numbers and its one event queue. Each logical device reads completions from its own thread,
+    * so two devices on one context took each other's events and dropped them, and the second
+    * device's fences never signalled (probe/mali/vkdev2.c; a test app that keeps its D3D11
+    * device while it runs the D3D9 test). So each logical device opens its own context. */
+   const int dev_fd = pan_kmod_dev_is_kbase(physical_device->kmod.dev)
+                         ? open(PANVK_KBASE_PATH, O_RDWR | O_CLOEXEC)
+                         : os_dupfd_cloexec(physical_device->kmod.dev->fd);
+   device->kmod.dev =
+      dev_fd < 0 ? NULL
+                 : pan_kmod_dev_create(dev_fd, physical_device->kmod.dev->flags,
+                                       &device->kmod.allocator);
+   if (!device->kmod.dev && dev_fd >= 0)
+      close(dev_fd);
 
    if (!device->kmod.dev) {
       result = panvk_errorf(instance, VK_ERROR_OUT_OF_HOST_MEMORY,
@@ -699,6 +713,7 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
    result = panvk_meta_init(device);
    if (result != VK_SUCCESS)
       goto err_free_draw_ctx;
+   panvk_bc_emu_device_init(device);
 
 #if PAN_ARCH < 9
    /* Always, not only with nullDescriptor: a few KB, and an application that binds null without
@@ -743,6 +758,7 @@ err_finish_queues:
    vk_foreach_queue_safe(queue, &device->vk)
       panvk_queue_destroy(queue);
 
+   panvk_bc_emu_device_finish(device);
    panvk_meta_cleanup(device);
 
 err_free_draw_ctx:
@@ -817,6 +833,7 @@ panvk_per_arch(destroy_device)(struct panvk_device *device,
 #if PAN_ARCH >= 10 && PAN_ARCH < 14
    panvk_per_arch(device_draw_context_cleanup)(device);
 #endif
+   panvk_bc_emu_device_finish(device);
    panvk_meta_cleanup(device);
    vk_pipeline_cache_destroy(device->vk.mem_cache, NULL);
    pan_kmod_bo_put(device->sparse_mem.blackhole);

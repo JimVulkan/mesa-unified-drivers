@@ -20,6 +20,7 @@
 #include <sys/utsname.h>
 #if DETECT_OS_ANDROID
 #include <dlfcn.h>
+#include <sys/system_properties.h>
 #include <unistd.h>
 #endif
 
@@ -929,6 +930,24 @@ bool si_init_gfx_screen(struct si_screen *sscreen) {
 
    sscreen->context_roll_log_filename = debug_get_option("AMD_ROLLS", NULL);
    sscreen->shader_debug_flags = debug_get_flags_option("AMD_DEBUG", radeonsi_shader_debug_options, 0);
+
+   /* Xclipse: Wave32 pixel shaders by default. radeonsi keeps a GFX10.3 pixel shader with inputs
+    * on Wave64 because interpolation is slower in Wave32 there, and prefers Wave64 on GFX11 for the
+    * dual-issue VALU. Neither applies here: the shader core interpolates the GFX11 way (ALU
+    * instructions) and has no dual issue. With a Minecraft shader pack (heavy deferred PS at 96-168
+    * VGPRs) Wave32 went from ~10 to 15 fps. MESA_XCLIPSE_W32PS or debug.mesa_xclipse_w32ps 0 turns
+    * it off; AMD_DEBUG=w32ps/w64ps still win. */
+   if (sscreen->info.gfx11_shader_core &&
+       !(sscreen->shader_debug_flags & (DBG(W32_PS) | DBG(W64_PS)))) {
+      const char *w32 = getenv("MESA_XCLIPSE_W32PS");
+#if DETECT_OS_ANDROID
+      char prop[PROP_VALUE_MAX] = {0};
+      if (!(w32 && w32[0]) && __system_property_get("debug.mesa_xclipse_w32ps", prop) > 0)
+         w32 = prop;
+#endif
+      if (!(w32 && w32[0] == '0'))
+         sscreen->shader_debug_flags |= DBG(W32_PS);
+   }
 
    if (sscreen->debug_flags & DBG(NO_DISPLAY_DCC)) {
       sscreen->info.use_display_dcc_unaligned = false;

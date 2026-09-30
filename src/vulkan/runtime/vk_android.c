@@ -191,7 +191,7 @@ vk_gralloc_to_drm_explicit_layout(
 
 /* The dma-buf is not always the handle's first fd: MediaTek's ARM gralloc handle carries three,
  * the first is -1 and the buffer is the second. The gralloc backend that parsed the handle knows
- * which, so ask it, and fall back to the first fd.
+ * which, so ask it, and fall back to the largest fd.
  */
 int
 vk_android_native_handle_dma_buf_fd(const struct native_handle *handle,
@@ -210,7 +210,20 @@ vk_android_native_handle_dma_buf_fd(const struct native_handle *handle,
           info.fds[0] > 0)
          return info.fds[0];
    }
-   return handle->data[0];
+   /* No backend parsed it: the largest fd, which on MediaTek is not the first. */
+   int fd = handle->data[0];
+   off_t best = 0;
+   for (int i = 0; i < handle->numFds; i++) {
+      if (handle->data[i] < 0)
+         continue;
+      const off_t sz = lseek(handle->data[i], 0, SEEK_END);
+      lseek(handle->data[i], 0, SEEK_SET);
+      if (sz > best) {
+         best = sz;
+         fd = handle->data[i];
+      }
+   }
+   return fd;
 }
 
 #if ANDROID_API_LEVEL >= 26

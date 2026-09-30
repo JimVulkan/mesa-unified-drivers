@@ -9,6 +9,7 @@
 
 #include "util/format/u_format.h"
 
+#include "util/list.h"
 #include "vk_format.h"
 #include "vk_image.h"
 
@@ -44,6 +45,15 @@ struct panvk_image {
 
    /* One image each for 2x 4x 8x 16x. We don't support more than 16x. */
    VkImage ms_imgs[4];
+
+   /* A linear image of an emulated BC format that shaders sample (panvk_bc_emu.h): on the
+    * device's list once bound, with the submission that last refreshed it. */
+   struct {
+      bool linear_sampled;
+      bool listed;
+      struct list_head link;
+      uint64_t seq;
+   } bc_emu;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(panvk_image, vk.base, VkImage,
